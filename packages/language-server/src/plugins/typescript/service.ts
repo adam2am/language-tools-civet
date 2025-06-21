@@ -148,6 +148,16 @@ export interface LanguageServiceDocumentContext {
     projectService: ProjectService | undefined;
     watchDirectory: ((patterns: RelativePattern[]) => void) | undefined;
     nonRecursiveWatchPattern: string | undefined;
+    /**
+     * A hook to decorate the language service with additional functionality.
+     * This can be used by plugins to extend the language service's capabilities.
+     * @param languageService The original language service instance
+     * @param context Contextual information that might be needed by the decorator
+     */
+    decorateLanguageService?(
+        languageService: ts.LanguageService,
+        context: { host: ts.LanguageServiceHost; ts: typeof ts }
+    ): ts.LanguageService;
 }
 
 export async function getService(
@@ -431,7 +441,10 @@ async function createLanguageService(
     };
 
     const project = initLsCacheProject();
-    const languageService = ts.createLanguageService(host, documentRegistry);
+    const initialLanguageService = ts.createLanguageService(host, documentRegistry);
+    const languageService =
+        docContext.decorateLanguageService?.(initialLanguageService, { host, ts }) ??
+        initialLanguageService;
 
     docContext.globalSnapshotsManager.onChange(scheduleUpdate);
 

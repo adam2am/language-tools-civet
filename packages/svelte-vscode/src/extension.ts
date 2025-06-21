@@ -270,6 +270,17 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
 
     addOpenLinkCommand(context);
 
+    // --- Civet config watching: restart LS when any Civet config file changes
+    const civetWatcher = workspace.createFileSystemWatcher(
+        '**/{🐈,civetconfig,civet.config}.{json,yaml,yml,civet,js}'
+    );
+
+    civetWatcher.onDidChange(() => restartLS(false));
+    civetWatcher.onDidCreate(() => restartLS(false));
+    civetWatcher.onDidDelete(() => restartLS(false));
+
+    context.subscriptions.push(civetWatcher);
+
     languages.setLanguageConfiguration('svelte', {
         indentationRules: {
             // Matches a valid opening tag that is:

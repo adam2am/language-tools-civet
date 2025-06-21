@@ -27,6 +27,7 @@ import { createProjectService } from './serviceCache';
 import { GlobalSnapshotsManager, SnapshotManager } from './SnapshotManager';
 import { isSubPath } from './utils';
 import { FileMap, FileSet } from '../../lib/documents/fileCollection';
+import { civetDecorateLanguageService } from './civetDecorator';
 
 interface LSAndTSDocResolverOptions {
     notifyExceedSizeLimit?: () => void;
@@ -128,7 +129,8 @@ export class LSAndTSDocResolver {
                 ? this.watchDirectory.bind(this)
                 : undefined,
             nonRecursiveWatchPattern: this.options?.nonRecursiveWatchPattern,
-            reportConfigError: this.options?.reportConfigError
+            reportConfigError: this.options?.reportConfigError,
+            decorateLanguageService: civetDecorateLanguageService
         };
     }
 
