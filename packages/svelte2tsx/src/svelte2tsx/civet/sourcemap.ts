@@ -274,23 +274,25 @@ export function normalizeCivetMap(
     generatedLinesWithMappings.add(anchor.end.line);
   }
 
+  const added = new Set<string>();
   for (const line of generatedLinesWithMappings) {
     const blockStartLineInSvelte = originalContentStartLine_1based;
     const blockStartColInSvelte = removedIndentLength; // indent length
 
-    // Column 0 – indent itself
-    addMapping(gen, {
-      source: svelteFilePath,
-      generated: { line: line + 1, column: 0 },
-      original: { line: blockStartLineInSvelte + line, column: blockStartColInSvelte },
-    });
+    const maybeAdd = (col: number) => {
+      const key = `${line}:${col}`;
+      if (added.has(key)) return;
+      added.add(key);
+      addMapping(gen, {
+        source: svelteFilePath,
+        generated: { line: line + 1, column: col },
+        original: { line: blockStartLineInSvelte + line, column: blockStartColInSvelte },
+      });
+    };
 
-    // Column where the `import` keyword starts (after indent)
-    addMapping(gen, {
-      source: svelteFilePath,
-      generated: { line: line + 1, column: removedIndentLength },
-      original: { line: blockStartLineInSvelte + line, column: blockStartColInSvelte },
-    });
+    // Ensure at least col 0 and col indent mapping exist
+    maybeAdd(0);
+    if (removedIndentLength > 0) maybeAdd(removedIndentLength);
   }
 
   /* --------------------------------------------------------------
