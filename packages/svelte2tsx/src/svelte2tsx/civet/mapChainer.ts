@@ -197,17 +197,17 @@ export function chainMaps(
         if (tracedPrev && tracedPrev.length >= 4) {
           const deltaCol = relCol_0based_in_compiled_ts_snippet - backtrackCol;
           const adjustedOrigCol = tracedPrev[3] + deltaCol;
-          remappedScript.push([generatedCol, 0, tracedPrev[2], adjustedOrigCol, nameIndex]);
+          remappedScript.push([generatedCol, 0, tracedPrev[2], adjustedOrigCol, nameIndex].filter(n => n !== undefined));
           if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED at exact col. Used backtrack to col ${backtrackCol}. New segment: [${generatedCol}, 0, ${tracedPrev[2]}, ${adjustedOrigCol}${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
         } else {
           // Still no luck – fall back to script start
           const fallbackOrigLine_0based = block.originalContentStartLine_Svelte_1based - 1;
-          remappedScript.push([generatedCol, 0, fallbackOrigLine_0based, 0, nameIndex]);
+          remappedScript.push([generatedCol, 0, fallbackOrigLine_0based, 0, nameIndex].filter(n => n !== undefined));
           if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED after backtrack. Fallback to Svelte L${fallbackOrigLine_0based+1}C0. Final segment: [${generatedCol}, 0, ${fallbackOrigLine_0based}, 0${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
         }
       } else {
         // Normal successful trace path
-        remappedScript.push([generatedCol, 0, traced[2], traced[3], nameIndex]);
+        remappedScript.push([generatedCol, 0, traced[2], traced[3], nameIndex].filter(n => n !== undefined));
         if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Traced OK. Final segment: [${generatedCol}, 0, ${traced[2]}, ${traced[3]}${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
       }
     }

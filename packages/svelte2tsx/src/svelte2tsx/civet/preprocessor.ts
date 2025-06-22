@@ -70,7 +70,8 @@ export function preprocessCivet(
 
       const start = tag.content.start; // Offset in the *original* svelte string.
       const end = tag.content.end;
-      const snippet = svelte.slice(start, end);
+      const snippet = svelte.slice(start, end).replace(/\s+$/, '');
+      
       // Remove leading blank lines to avoid offset mismatches
       const snippetTrimmed = snippet.replace(/^(?:[ \t]*[\r\n])+/, '');
 

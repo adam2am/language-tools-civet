@@ -36,7 +36,7 @@ export function normalizeCivetMap(
     text: string;              // identifier name or full literal (incl quotes or numeric text)
     start: ts.LineAndCharacter;
     end: ts.LineAndCharacter;
-    kind: 'identifier' | 'stringLiteral' | 'numericLiteral';
+    kind: 'identifier' | 'stringLiteral' | 'numericLiteral' | 'operator';
   }
 
   const tsAnchors: Anchor[] = [];
@@ -49,7 +49,7 @@ export function normalizeCivetMap(
         true
       );
 
-      function visit(node: ts.Node) {
+      function walk(node: ts.Node) {
         if (ts.isIdentifier(node)) {
           const name = node.text;
           const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile, false));
@@ -77,9 +77,17 @@ export function normalizeCivetMap(
           tsAnchors.push({ text: numText, start, end, kind: 'numericLiteral' });
         }
 
-        ts.forEachChild(node, visit);
+        // Operators and Punctuation
+        if (ts.isToken(node) && node.kind >= ts.SyntaxKind.FirstPunctuation && node.kind <= ts.SyntaxKind.LastPunctuation) {
+            const operatorText = node.getText(sourceFile);
+            const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile, false));
+            const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
+            tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
+        }
+
+        node.getChildren(sourceFile).forEach(walk);
       }
-      visit(sourceFile);
+      walk(sourceFile);
     } catch (e) {
       console.error(`[MAP_TO_V3 ${svelteFilePath}] Error parsing compiled TS for AST: ${(e as Error).message}`);
     }
@@ -97,6 +105,21 @@ export function normalizeCivetMap(
 
   // To avoid re-searching the same Civet line, we cache found identifier positions.
   const civetLineIdMatchCache = new Map<number, { text: string, column: number }[]>();
+  // Cache of numeric literal positions for each Civet line. Extracted once per line on demand.
+  const civetLineNumMatchCache = new Map<number, { text: string; column: number }[]>();
+
+  // Defines mappings from compiled TypeScript operators back to their original
+  // Civet source text. This is necessary because the TS AST only sees the
+  // compiled form (e.g., '==='), but we need to search for the original
+  // text (e.g., ' is ') in the Civet snippet.
+  const OPERATOR_MAP: Record<string, string> = {
+      '===': ' is ',
+      '!==': ' isnt ',
+      '&&':  ' and ',
+      '||':  ' or ',
+      '!':   'not '
+      // Add other mappings as needed
+  };
 
   // Create a quick lookup to find the approximate Civet snippet line for a given TS line.
   const tsLineToCivetLine = new Map<number, number>();
@@ -147,6 +170,7 @@ export function normalizeCivetMap(
     let cacheKey: string;
 
     if (anchor.kind === 'identifier') {
+      // ---------------- Identifier ----------------
       const available = civetLineIdMatchCache.get(civetSnippetLineIdx)!;
       cacheKey = `${civetSnippetLineIdx}:${anchor.text}`;
       const consumedCount = consumedMatches.get(cacheKey) || 0;
@@ -156,16 +180,53 @@ export function normalizeCivetMap(
         targetColumn = pick.column;
         consumedMatches.set(cacheKey, consumedCount + 1);
       }
-    } else { // stringLiteral or numericLiteral
-      const keyPrefix = anchor.kind === 'stringLiteral' ? 'str' : 'num';
-      cacheKey = `${civetSnippetLineIdx}:${keyPrefix}:${anchor.text}`;
+    } else if (anchor.kind === 'numericLiteral') {
+      // ---------------- Numeric Literal ----------------
+      if (!civetLineNumMatchCache.has(civetSnippetLineIdx)) {
+        const matches: { text: string; column: number }[] = [];
+        const numRegex = /\b\d+(?:\.\d+)?\b/g; // standalone numeric tokens
+        let m: RegExpExecArray | null;
+        while ((m = numRegex.exec(lineText)) !== null) {
+          matches.push({ text: m[0], column: m.index });
+        }
+        civetLineNumMatchCache.set(civetSnippetLineIdx, matches);
+      }
+      const available = civetLineNumMatchCache.get(civetSnippetLineIdx)!;
+      cacheKey = `${civetSnippetLineIdx}:num:${anchor.text}`;
+      const consumedCount = consumedMatches.get(cacheKey) || 0;
+      const potential = available.filter(m => m.text === anchor.text);
+      const pick = potential[consumedCount];
+      if (pick) {
+        targetColumn = pick.column;
+        consumedMatches.set(cacheKey, consumedCount + 1);
+      }
+    } else if (anchor.kind === 'stringLiteral') {
+      // ---------------- String Literal ----------------
+      const searchText = anchor.text; // includes quotes
+      cacheKey = `${civetSnippetLineIdx}:str:${searchText}`;
       const consumedCount = consumedMatches.get(cacheKey) || 0;
       let idx = -1;
       let searchFrom = 0;
       for (let found = 0; found <= consumedCount; found++) {
-        idx = lineText.indexOf(anchor.text, searchFrom);
+        idx = lineText.indexOf(searchText, searchFrom);
         if (idx === -1) break;
-        searchFrom = idx + anchor.text.length;
+        searchFrom = idx + searchText.length;
+      }
+      if (idx !== -1) {
+        targetColumn = idx;
+        consumedMatches.set(cacheKey, consumedCount + 1);
+      }
+    } else {
+      // ---------------- Operator / punctuation ----------------
+      const searchText = OPERATOR_MAP[anchor.text] || anchor.text;
+      cacheKey = `${civetSnippetLineIdx}:op:${searchText}`;
+      const consumedCount = consumedMatches.get(cacheKey) || 0;
+      let idx = -1;
+      let searchFrom = 0;
+      for (let found = 0; found <= consumedCount; found++) {
+        idx = lineText.indexOf(searchText, searchFrom);
+        if (idx === -1) break;
+        searchFrom = idx + searchText.length;
       }
       if (idx !== -1) {
         targetColumn = idx;
@@ -189,7 +250,7 @@ export function normalizeCivetMap(
     });
 
     // Add mapping for end of anchor
-    const endColAdjustment = anchor.kind === 'stringLiteral' ? anchor.text.length - 1 : anchor.text.length;
+    const endColAdjustment = anchor.kind === 'stringLiteral' ? anchor.text.length - 1 : (OPERATOR_MAP[anchor.text]?.length ?? anchor.text.length)
     addMapping(gen, {
       source: svelteFilePath,
       generated: { line: anchor.end.line + 1, column: anchor.end.character - (anchor.kind === 'stringLiteral' ? 1 : 0) },
