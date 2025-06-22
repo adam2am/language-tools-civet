@@ -31,6 +31,17 @@ export function normalizeCivetMap(
   svelteFilePath: string,
   compiledTsCode?: string                // optional TS snippet for AST-based enhancements
 ): EncodedSourceMap {
+  // Map TS operator tokens to their Civet equivalents. Defined up-front so the
+  // AST walker and later search logic can reference it safely.
+  const OPERATOR_MAP: Record<string, string> = {
+    '===': ' is ',
+    '!==': ' isnt ',
+    '&&':  ' and ',
+    '||':  ' or ',
+    '!':   'not '
+    // Extend as needed
+  };
+
   // Phase 1: Collect identifier anchors *and* import string-literal anchors from TS AST.
   interface Anchor {
     text: string;              // identifier name or full literal (incl quotes or numeric text)
@@ -80,9 +91,12 @@ export function normalizeCivetMap(
         // Operators and Punctuation
         if (ts.isToken(node) && node.kind >= ts.SyntaxKind.FirstPunctuation && node.kind <= ts.SyntaxKind.LastPunctuation) {
             const operatorText = node.getText(sourceFile);
-            const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile, false));
-            const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
-            tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
+            // Only collect operators we know how to map back to Civet text
+            if (OPERATOR_MAP.hasOwnProperty(operatorText)) {
+                const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile, false));
+                const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
+                tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
+            }
         }
 
         node.getChildren(sourceFile).forEach(walk);
@@ -107,19 +121,6 @@ export function normalizeCivetMap(
   const civetLineIdMatchCache = new Map<number, { text: string, column: number }[]>();
   // Cache of numeric literal positions for each Civet line. Extracted once per line on demand.
   const civetLineNumMatchCache = new Map<number, { text: string; column: number }[]>();
-
-  // Defines mappings from compiled TypeScript operators back to their original
-  // Civet source text. This is necessary because the TS AST only sees the
-  // compiled form (e.g., '==='), but we need to search for the original
-  // text (e.g., ' is ') in the Civet snippet.
-  const OPERATOR_MAP: Record<string, string> = {
-      '===': ' is ',
-      '!==': ' isnt ',
-      '&&':  ' and ',
-      '||':  ' or ',
-      '!':   'not '
-      // Add other mappings as needed
-  };
 
   // Create a quick lookup to find the approximate Civet snippet line for a given TS line.
   const tsLineToCivetLine = new Map<number, number>();
