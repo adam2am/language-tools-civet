@@ -50,6 +50,14 @@ export function preprocessCivet(
     const lang = getAttributeValue((tag).attributes, 'lang');
     if (lang !== 'civet') continue;
 
+    const start = tag.content.start; // Offset in the *original* svelte string.
+    const end = tag.content.end;
+    const snippet = svelte.slice(start, end).replace(/\s+$/, '');
+    
+    // Remove leading blank lines to avoid offset mismatches
+    const snippetTrimmed = snippet.replace(/^(?:[ \t]*[\r\n])+/, '');
+    const { dedented: dedentedSnippet, indent: removedIndentString } = stripCommonIndent(snippetTrimmed);
+
     try {
       const context = getAttributeValue(tag.attributes, 'context');
       const hasModuleAttribute = tag.attributes.some(attr => attr.name === 'module');
@@ -68,13 +76,6 @@ export function preprocessCivet(
           langValueEnd   = langValueNode.end - 1;   // exclude closing quote
       }
 
-      const start = tag.content.start; // Offset in the *original* svelte string.
-      const end = tag.content.end;
-      const snippet = svelte.slice(start, end).replace(/\s+$/, '');
-      
-      // Remove leading blank lines to avoid offset mismatches
-      const snippetTrimmed = snippet.replace(/^(?:[ \t]*[\r\n])+/, '');
-
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] Original Civet snippet before dedent:
 ${snippet}`);
       if (civetPreprocessorDebug) {
@@ -83,7 +84,6 @@ ${snippet}`);
       }
 
       // Dedent the trimmed snippet to strip common leading whitespace for accurate mapping
-      const { dedented: dedentedSnippet, indent: removedIndentString } = stripCommonIndent(snippetTrimmed);
       const commonIndentLength = removedIndentString.length;
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] Civet snippet after dedent:
 ${dedentedSnippet}`);
@@ -107,10 +107,10 @@ ${compiledTsCode}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] compileCivet output code length: ${compiledTsCode.length}, rawMap lines count: ${rawMap && 'lines' in rawMap ? rawMap.lines.length : 0}`);
 
       if (!rawMap || !('lines' in rawMap)) {
-          // Civet compilation failed or returned no usable map.  Leave the original
-          // <script lang="civet"> unchanged (no lang overwrite) and keep the original
-          // snippet so that downstream tooling still sees valid Civet code.
-          ms.overwrite(start, end, snippet);
+          // Skip any mutation of this <script> block so that the original source
+          // (including the original indent/whitespace) stays intact. This
+          // avoids accidental position shifts when Civet compilation fails or
+          // returns no usable sourcemap.
           continue;
       }
 
@@ -207,10 +207,6 @@ ${compiledTsCode}`);
              *        column = removedIndentLength    + relColumn - 1  (indent was stripped)
              */
 
-            const rawSnippet = svelte.slice(tag.content.start, tag.content.end);
-            const snippetTrimmed = rawSnippet.replace(/^(?:[ \t]*[\r\n])+/,'');
-            const { dedented: dedentedSnippet, indent: removedIndentStr } = stripCommonIndent(snippetTrimmed);
-
             // --- Approach 2: If the failing character is whitespace (space, tab, newline, CR), walk left until non-whitespace or start of file.
             let adjustedOffset = err.offset;
             const isWs = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
@@ -226,7 +222,7 @@ ${compiledTsCode}`);
             const originalContentStartLine = getActualContentStartLine(svelte, tag.content.start); // 1-based
 
             const absoluteLine   = originalContentStartLine + relLine  - 1; // 1-based
-            const absoluteColumn = removedIndentStr.length + relCol - 1;    // convert relCol (1-based) to 0-based within full Svelte file
+            const absoluteColumn = removedIndentString.length + relCol - 1;    // convert relCol (1-based) to 0-based within full Svelte file
 
             const width = 4; // highlight up to four characters for visibility
             const lineText = svelte.split(/\r?\n/)[absoluteLine - 1] || '';
