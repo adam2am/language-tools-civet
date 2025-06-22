@@ -43,7 +43,7 @@ export function preprocessCivet(
   });
   const result: PreprocessResult = { code: svelte };
 
-  let totalOffsetShift = 0;
+  let cumulativeOffsetShift = 0;
 
   for (const tag of tags) {
     if (tag.type !== 'Script') continue;
@@ -69,7 +69,6 @@ export function preprocessCivet(
       const langAttributeNode = tag.attributes.find(attr => attr.name === 'lang' && attr.value !== true);
       let langValueStart = -1;
       let langValueEnd = -1;
-      let currentTagAttributeOffsetShift = 0; // will be set only when overwrite actually happens
       if (langAttributeNode && Array.isArray(langAttributeNode.value) && langAttributeNode.value.length > 0) {
           const langValueNode = langAttributeNode.value[0]; // Text node
           langValueStart = langValueNode.start + 1; // skip opening quote
@@ -142,40 +141,39 @@ ${compiledTsCode}`);
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] normalized map first semicolon segment: ${mapFromNormalize.mappings.split(';')[0]}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] normalizeCivetMap returned map mappings length: ${mapFromNormalize.mappings.split(';').length}`);
 
-      // At this point compilation succeeded.  Perform the delayed lang="ts" overwrite.
-      if (langValueStart !== -1) {
-          const originalLength = langValueEnd - langValueStart;
-          ms.overwrite(langValueStart, langValueEnd, 'ts');
-          currentTagAttributeOffsetShift = 'ts'.length - originalLength;
-      }
-
+      // --- Rewrite the Svelte file content ---
       const indentString = removedIndentString;
       const trimmedCompiledTsCode = compiledTsCode.replace(/\r?\n+$/g, '');
       const reindentedTsCode = '\n' + trimmedCompiledTsCode.split('\n').map(line => `${indentString}${line}`).join('\n') + '\n';
+      
+      const langAttrLengthChange = (langValueStart !== -1) ? ('ts'.length - (langValueEnd - langValueStart)) : 0;
+      const contentLenghtChange = reindentedTsCode.length - (end - start);
+      
+      // Perform overwrites now that all calculations are done.
+      if (langValueStart !== -1) {
+          ms.overwrite(langValueStart, langValueEnd, 'ts');
+      }
       ms.overwrite(start, end, reindentedTsCode);
+
+      // --- Calculate final positions and build block data ---
+      // The start of the script block in the *final string* is its original `start`
+      // plus all shifts from previous blocks.
+      const blockStartInFinalString = start + cumulativeOffsetShift;
+      // The TS code content starts after the lang attribute has potentially changed length.
+      const tsContentStartInFinalString = blockStartInFinalString + langAttrLengthChange;
 
       const originalScriptBlockLineCount = svelte.slice(start, end).split('\n').length;
       const compiledTsLineCount = reindentedTsCode.split('\n').length;
 
       // Build per-line indent table (uniform for now but future-proof)
       const removedIndentPerLine = Array.from({ length: compiledTsLineCount }, () => commonIndentLength);
-
-      const effectiveContentStartInFinalString = start + totalOffsetShift;
-      const tsEndInSvelteWithTs = effectiveContentStartInFinalString + reindentedTsCode.length;
-
-      // actualTsCodeStartOffset needs to be the offset in the *final string* (svelteWithTs)
-      // where the TS code (after the \\n and indent added by reindentedTsCode) begins.
-      // `start` is the offset of the original script content in the *original* svelte string.
-      // After attributes like lang="civet" are changed to lang="ts", this `start` position shifts.
-      // `effectiveContentStartInFinalString` accounts for previous blocks' changes.
-      // `currentTagAttributeOffsetShift` accounts for the change in this block's lang attribute.
-      // The actual code within reindentedTsCode begins after its leading '\\n' and its indent.
-      const actualTsCodeStartOffset = effectiveContentStartInFinalString + currentTagAttributeOffsetShift + 1 + commonIndentLength;
       
       const blockData = {
         map: mapFromNormalize as any, // Cast to any to bypass complex type issue for now, assuming structure is EncodedSourceMap compatible
-        tsStartInSvelteWithTs: actualTsCodeStartOffset,
-        tsEndInSvelteWithTs,
+        // The actual code starts after the leading newline and indent.
+        tsStartInSvelteWithTs: tsContentStartInFinalString + 1 + commonIndentLength,
+        // The end is the start of the new content plus its length.
+        tsEndInSvelteWithTs: tsContentStartInFinalString + reindentedTsCode.length,
         originalContentStartLine: originalContentStartLine_1based,
         originalCivetLineCount: originalScriptBlockLineCount,
         compiledTsLineCount,
@@ -192,7 +190,7 @@ ${compiledTsCode}`);
         result.instance = blockData;
       }
 
-      totalOffsetShift += currentTagAttributeOffsetShift + (reindentedTsCode.length - (end - start));
+      cumulativeOffsetShift += langAttrLengthChange + contentLenghtChange;
 
     } catch (err: any) {
         if (err.name === 'ParseError' && typeof err.offset === 'number') {

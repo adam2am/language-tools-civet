@@ -72,11 +72,11 @@ export function chainMaps(
   const svelteWithTsLineOffsets = new LineOffsetCalculator(svelteWithTsContent);
   const decodedBaseMap = decode(baseMap.mappings);
   if (chainCivetDebug) console.log('[CHAIN_MAPS] Decoded baseMap segments (first 5 lines):', JSON.stringify(decodedBaseMap.slice(0,5)));
-  console.log(`[CHAIN_MAPS] Decoded baseMap (Svelte->TSX) has ${decodedBaseMap.length} lines of mappings.`);
+  if (chainCivetDebug) console.log(`[CHAIN_MAPS] Decoded baseMap (Svelte->TSX) has ${decodedBaseMap.length} lines of mappings.`);
 
   const blockTracers = blocks.map((block, i) => {
-    console.log(`[CHAIN_MAPS] Initializing TraceMap for Block ${i} (Civet-TS -> Svelte). Map sources: ${JSON.stringify(block.map.sources)}, Map file: ${block.map.file}`);
-    console.log(`[CHAIN_MAPS] Block ${i} map mappings (first 3 lines): ${block.map.mappings.split(';').slice(0,3).join(';')}`);
+    if (chainCivetDebug) console.log(`[CHAIN_MAPS] Initializing TraceMap for Block ${i} (Civet-TS -> Svelte). Map sources: ${JSON.stringify(block.map.sources)}, Map file: ${block.map.file}`);
+    if (chainCivetDebug) console.log(`[CHAIN_MAPS] Block ${i} map mappings (first 3 lines): ${block.map.mappings.split(';').slice(0,3).join(';')}`);
     return new TraceMap({
     version: 3,
     sources: block.map.sources,
@@ -151,15 +151,9 @@ export function chainMaps(
 
       const relCol_0based_in_compiled_ts_snippet = origCol0_InSvelteWithTS - indentRemovedForThisLine;
 
-      const isTwoFooFixture = block.map.file?.includes('twoFooUserRequest.svelte');
       // DYNAMIC LOG for foo1 target area in twoFooUserRequest
       // TSX L4C10 should be origLine0_InSvelteWithTS = 1 (for <script> content line 2), origCol0_InSvelteWithTS = 10 (approx, for foo1)
       // relLine should be 0, relCol should be around 8 for `foo1` in `function foo1()`
-      if (isTwoFooFixture && chainCivetDebug && 
-          currentGeneratedTSXLine_1based === 4 && generatedCol === 10 && blockIndex === 0) { // blockIndex 0 is usually instance script
-          console.log(`[CHAIN_MAPS_DYN_DEBUG_FOO1_TRACE_INPUT ${block.map.file}] TSX L${currentGeneratedTSXLine_1based}C${generatedCol} (Block ${blockIndex}): Tracing with relLineInCompiledTS_0based=${relLine_0based_in_compiled_ts_snippet}, relColInCompiledTS_0based=${relCol_0based_in_compiled_ts_snippet}`);
-      }
-
       if (chainCivetDebug) console.log(`[CHAIN_MAPS] TSX L${currentGeneratedTSXLine_1based}C${generatedCol} (SCRIPT): Tracing Block ${blockIndex}. RelLineInCompiledTS(0): ${relLine_0based_in_compiled_ts_snippet}, RelColInCompiledTS(0): ${Math.max(0, relCol_0based_in_compiled_ts_snippet)}. (origSvelteWithTsL0: ${origLine0_InSvelteWithTS}, origSvelteWithTsC0: ${origCol0_InSvelteWithTS}, blockStartL1: ${block.tsStartLineInSvelteWithTs}, blockStartC0: ${block.tsStartColInSvelteWithTs})`);
 
       let traced: readonly number[] | null = null;
