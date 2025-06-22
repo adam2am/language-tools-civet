@@ -33,10 +33,10 @@ export function normalizeCivetMap(
 ): EncodedSourceMap {
   // Phase 1: Collect identifier anchors *and* import string-literal anchors from TS AST.
   interface Anchor {
-    text: string;              // identifier name or full literal (incl quotes)
+    text: string;              // identifier name or full literal (incl quotes or numeric text)
     start: ts.LineAndCharacter;
     end: ts.LineAndCharacter;
-    kind: 'identifier' | 'stringLiteral';
+    kind: 'identifier' | 'stringLiteral' | 'numericLiteral';
   }
 
   const tsAnchors: Anchor[] = [];
@@ -68,6 +68,15 @@ export function normalizeCivetMap(
           const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
           tsAnchors.push({ text: literalTextWithQuotes, start, end, kind: 'stringLiteral' });
         }
+
+        // Numeric literals
+        if (ts.isNumericLiteral(node)) {
+          const numText = node.getText(sourceFile); // e.g., "3", "1", "10.5"
+          const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile, false));
+          const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
+          tsAnchors.push({ text: numText, start, end, kind: 'numericLiteral' });
+        }
+
         ts.forEachChild(node, visit);
       }
       visit(sourceFile);
@@ -147,9 +156,9 @@ export function normalizeCivetMap(
         targetColumn = pick.column;
         consumedMatches.set(cacheKey, consumedCount + 1);
       }
-    } else {
-      // stringLiteral – find first occurrence of the literal (including quotes)
-      cacheKey = `${civetSnippetLineIdx}:str:${anchor.text}`;
+    } else { // stringLiteral or numericLiteral
+      const keyPrefix = anchor.kind === 'stringLiteral' ? 'str' : 'num';
+      cacheKey = `${civetSnippetLineIdx}:${keyPrefix}:${anchor.text}`;
       const consumedCount = consumedMatches.get(cacheKey) || 0;
       let idx = -1;
       let searchFrom = 0;
