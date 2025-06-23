@@ -66,8 +66,6 @@ export interface BlockInfo {
         commonLength: number;
         perLineLengths?: number[];
     };
-    /** Raw mapping lines from the Civet compiler before normalization */
-    rawMapLines?: number[][][];
 }
 
 /**

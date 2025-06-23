@@ -78,7 +78,7 @@ export function chainMaps(
     blocks.forEach((block, i) => console.log(`[CHAIN_MAPS] Block ${i}: originalLines=${block.civet.lineCount}, compiledLines=${block.ts.lineCount}, tsStartChar=${block.tsSnippet.startOffset}, tsEndChar=${block.tsSnippet.endOffset}, tsStartLine=${block.tsSnippet.startLine}, svelteOffset_0_based=${block.svelte.civetStartIndex}, removedIndent=${block.sourceIndent.commonLength}, mapFile=${block.map.file}, mapSources=${JSON.stringify(block.map.sources)}`));
   }
 
-  const svelteWithTsLineOffsets = new LineCalc(svelteWithTsContent);
+  const preprocessedLineCalc = new LineCalc(svelteWithTsContent);
   const baseLines = decode(baseMap.mappings);
   if (chainCivetDebug) console.log('[CHAIN_MAPS] Decoded baseMap segments (first 5 lines):', JSON.stringify(baseLines.slice(0,5)));
   if (chainCivetDebug) console.log(`[CHAIN_MAPS] Decoded baseMap (Svelte->TSX) has ${baseLines.length} lines of mappings.`);
@@ -116,9 +116,9 @@ export function chainMaps(
     if (chainCivetDebug) console.log(`\n[CHAIN_MAPS] Processing BaseMap segments for generated TSX line: ${currentGeneratedTSXLine_1based}`);
 
     for (const segment of lineSegments) {
-      const [generatedCol, , origLine0_InSvelteWithTS, origCol0_InSvelteWithTS] = segment;
-      const charOffset = svelteWithTsLineOffsets.getOffset(origLine0_InSvelteWithTS + 1, origCol0_InSvelteWithTS);
-      if (chainCivetDebug) console.log(`[CHAIN_MAPS] TSX L${currentGeneratedTSXLine_1based}C${generatedCol}: BaseMap segment maps to svelteWithTs L${origLine0_InSvelteWithTS+1}C${origCol0_InSvelteWithTS} (char offset ${charOffset})`);
+      const [generatedCol, , preprocessedLine, preprocessedCol] = segment;
+      const charOffset = preprocessedLineCalc.getOffset(preprocessedLine + 1, preprocessedCol);
+      if (chainCivetDebug) console.log(`[CHAIN_MAPS] TSX L${currentGeneratedTSXLine_1based}C${generatedCol}: BaseMap segment maps to svelteWithTs L${preprocessedLine+1}C${preprocessedCol} (char offset ${charOffset})`);
 
       // Find which block, if any, this offset belongs to
       let blockIndex = -1;
@@ -140,13 +140,13 @@ export function chainMaps(
     // Remap script segments via trace-mapping
     const codeLines: number[][] = [];
     for (const { segment, blockIndex } of codeSegs) {
-      const [generatedCol, , origLine0_InSvelteWithTS, origCol0_InSvelteWithTS, nameIndex] = segment;
+      const [generatedCol, , preprocessedLine, preprocessedCol, nameIndex] = segment;
       const block = blocks[blockIndex];
       const tracer = tracers[blockIndex];
       // Calculate relative line/col *within the compiled TS snippet* that block.map refers to.
-      // origLine0_InSvelteWithTS is 0-based line in the svelteWithTs content (where the <script> tag content starts)
+      // preprocessedLine is 0-based line in the svelteWithTs content (where the <script> tag content starts)
       // block.tsSnippet.startLine is 1-based line where the <script> tag content starts in svelteWithTs
-      const relLine_0based_in_compiled_ts_snippet = (origLine0_InSvelteWithTS + 1) - block.tsSnippet.startLine;
+      const tracerLine = (preprocessedLine + 1) - block.tsSnippet.startLine;
       // The tracer (normalized Civet map) expects columns relative to the dedented TS snippet.
       // We need to subtract the amount of indent that was artificially re-added when the TS
       // code was inserted back into the <script> block.  Most of the time this is the
@@ -154,40 +154,30 @@ export function chainMaps(
       // use that for higher accuracy / uneven indents.
       const indentRemovedForThisLine =
         (block.sourceIndent.perLineLengths &&
-         relLine_0based_in_compiled_ts_snippet < block.sourceIndent.perLineLengths.length)
-          ? block.sourceIndent.perLineLengths[relLine_0based_in_compiled_ts_snippet]
+         tracerLine < block.sourceIndent.perLineLengths.length)
+          ? block.sourceIndent.perLineLengths[tracerLine]
           : block.sourceIndent.commonLength;
 
-      const relCol_0based_in_compiled_ts_snippet = origCol0_InSvelteWithTS - indentRemovedForThisLine;
-
-      // DYNAMIC LOG for foo1 target area in twoFooUserRequest
-      // TSX L4C10 should be origLine0_InSvelteWithTS = 1 (for <script> content line 2), origCol0_InSvelteWithTS = 10 (approx, for foo1)
-      // relLine should be 0, relCol should be around 8 for `foo1` in `function foo1()`
-      if (chainCivetDebug) console.log(`[CHAIN_MAPS] TSX L${currentGeneratedTSXLine_1based}C${generatedCol} (SCRIPT): Tracing Block ${blockIndex}. RelLineInCompiledTS(0): ${relLine_0based_in_compiled_ts_snippet}, RelColInCompiledTS(0): ${Math.max(0, relCol_0based_in_compiled_ts_snippet)}. (origSvelteWithTsL0: ${origLine0_InSvelteWithTS}, origSvelteWithTsC0: ${origCol0_InSvelteWithTS}, blockStartL1: ${block.tsSnippet.startLine}, blockStartC0: ${block.tsSnippet.startCol})`);
+      const tracerCol = preprocessedCol - indentRemovedForThisLine;
 
       let traced: readonly number[] | null = null;
       try {
-        // Log the map being used by this tracer instance right before tracing critical segment
-        if (chainCivetDebug && blockIndex === 0 && relLine_0based_in_compiled_ts_snippet === 0 && relCol_0based_in_compiled_ts_snippet === 6) {
-            console.log(`[CHAIN_MAPS_CRITICAL_TRACE] Block ${blockIndex} Tracer (Normalized Civet-Svelte Map) Mappings (first 3 lines): ${block.map.mappings.split(';').slice(0,3).join(';')}`);
-            console.log(`[CHAIN_MAPS_CRITICAL_TRACE]                      Full Map (if short): ${block.map.mappings}`);
-        }
-        traced = traceSegment(tracer, relLine_0based_in_compiled_ts_snippet, Math.max(0, relCol_0based_in_compiled_ts_snippet));
+        traced = traceSegment(tracer, tracerLine, Math.max(0, tracerCol));
       } catch (e) {
         if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Error during traceSegment: ${(e as Error).message}`);
       }
 
       if (!(traced && traced.length >= 4)) {
         /* ---------------------------------------------------------
-         * Approach C: Backtrack leftward on the same line until we
+         * Backtrack leftward on the same line until we
          * find a column that traces, then shift the original column
          * by the delta between our target and the traced-column.
          * ------------------------------------------------------- */
-        let backtrackCol = relCol_0based_in_compiled_ts_snippet - 1;
+        let backtrackCol = tracerCol - 1;
         let tracedPrev: readonly number[] | null = null;
         while (backtrackCol >= 0) {
           try {
-            tracedPrev = traceSegment(tracer, relLine_0based_in_compiled_ts_snippet, backtrackCol);
+            tracedPrev = traceSegment(tracer, tracerLine, backtrackCol);
           } catch {
             tracedPrev = null;
           }
@@ -198,15 +188,14 @@ export function chainMaps(
         }
 
         if (tracedPrev && tracedPrev.length >= 4) {
-          const deltaCol = relCol_0based_in_compiled_ts_snippet - backtrackCol;
+          const deltaCol = tracerCol - backtrackCol;
           const adjustedOrigCol = tracedPrev[3] + deltaCol;
           codeLines.push([generatedCol, 0, tracedPrev[2], adjustedOrigCol, nameIndex].filter(n => n !== undefined));
           if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED at exact col. Used backtrack to col ${backtrackCol}. New segment: [${generatedCol}, 0, ${tracedPrev[2]}, ${adjustedOrigCol}${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
         } else {
           // Still no luck – fall back to script start
-          const fallbackOrigLine_0based = block.svelte.civetStartLine - 1;
-          codeLines.push([generatedCol, 0, fallbackOrigLine_0based, 0, nameIndex].filter(n => n !== undefined));
-          if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED after backtrack. Fallback to Svelte L${fallbackOrigLine_0based+1}C0. Final segment: [${generatedCol}, 0, ${fallbackOrigLine_0based}, 0${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
+          codeLines.push([generatedCol, 0, block.svelte.civetStartIndex, 0, nameIndex].filter(n => n !== undefined));
+          if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED after backtrack. Fallback to Svelte L${block.svelte.civetStartIndex + 1}C0. Final segment: [${generatedCol}, 0, ${block.svelte.civetStartIndex}, 0${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
         }
       } else {
         // Normal successful trace path
@@ -217,7 +206,7 @@ export function chainMaps(
     // Remap template segments by adjusting line delta
     const tmplLines: number[][] = [];
     for (const { segment, charOffset } of tmplSegs) {
-      const [generatedCol, , origLine0_InSvelteWithTS, origCol0_InSvelteWithTS, nameIndex] = segment;
+      const [generatedCol, , preprocessedLine, preprocessedCol, nameIndex] = segment;
       let delta = 0;
       for (let k = 0; k < blocks.length; k++) {
         if (charOffset < blocks[k].tsSnippet.startOffset) {
@@ -226,7 +215,7 @@ export function chainMaps(
         }
         delta = lineDeltas[k + 1];
       }
-      tmplLines.push([generatedCol, 0, origLine0_InSvelteWithTS - delta, origCol0_InSvelteWithTS, nameIndex]);
+      tmplLines.push([generatedCol, 0, preprocessedLine - delta, preprocessedCol, nameIndex]);
     }
     // Merge and sort segments by generated column
     const merged = codeLines.concat(tmplLines).sort((a, b) => a[0] - b[0]);
@@ -259,26 +248,3 @@ export function chainMaps(
     file: baseMap.file 
   };
 }
-
-// For backward compatibility: single-block chaining
-// This function's old signature is insufficient for the new chainMaps logic.
-// It would need full EnhancedChainBlock details.
-// If svelte2tsx/index.ts is updated to call the main chainMaps directly, this might become obsolete.
-// For now, it's updated to accept parts of EnhancedChainBlock, but it might not be practically callable
-// without significant changes at its call sites if they don't have all this information.
-export function chainSourceMaps(
-  baseMap: EncodedSourceMap,
-  blockDetails: Omit<ChainBlock, 'map'> & { map: EncodedSourceMap },
-  originalSvelteContent: string,
-  svelteWithTsContent: string
-): EncodedSourceMap {
-  const block: ChainBlock = {
-    map: blockDetails.map,
-    tsSnippet: (blockDetails as any).tsSnippet,
-    civet: (blockDetails as any).civet,
-    ts: (blockDetails as any).ts,
-    svelte: (blockDetails as any).svelte,
-    sourceIndent: (blockDetails as any).sourceIndent,
-  };
-  return chainMaps(baseMap, [block], originalSvelteContent, svelteWithTsContent);
-} 

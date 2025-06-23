@@ -44,6 +44,8 @@ export function preprocessCivet(
   const result: ProcessResult = { code: svelteCode };
 
   let offsetShift = 0;
+  // Hoist config loading out of the loop to avoid redundant fs calls
+  const civetCompileOptions = loadCompileOpts(filename);
 
   for (const tag of tags) {
     if (tag.type !== 'Script') continue;
@@ -88,10 +90,6 @@ ${snippet}`);
 ${content}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] Dedented snippet content:\n${content}`);
       
-
-      // Discover user Civet configuration synchronously so the LS respects parseOptions
-      const civetCompileOptions = loadCompileOpts(filename);
-
       // Compile Civet to TS and get raw sourcemap from dedented snippet
       const { code: tsCode, rawMap: civetMapRaw } = compileCivet(
         content,
@@ -113,12 +111,6 @@ ${tsCode}`);
           continue;
       }
 
-      // Add a dummy trailing segment to each rawMap line to help IDE reference-boundary detection
-      // This is a pure generated-column delta ([1]) and will not produce its own mapping.
-      (civetMapRaw.lines as number[][][]).forEach(lineSegments => {
-        lineSegments.push([1]);
-      });
-
       // Compute line offset for snippet within the Svelte file dynamically by finding first content line
       const civetContentStartLine = getActualContentStartLine(svelteCode, start);
       const civetSnippetStartLineIndex = civetContentStartLine - 1;
@@ -126,7 +118,6 @@ ${tsCode}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] Civet snippet offsets ${start}-${end} -> Svelte line ${civetContentStartLine}`);
 
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] originalContentStartLine_1based: ${civetContentStartLine}, snippet offset (0-based): ${civetSnippetStartLineIndex}`);
-
 
       // Normalize the Civet sourcemap to a standard V3 map
       const mapFromNormalize = normalizeCivetMap(
@@ -147,7 +138,7 @@ ${tsCode}`);
       const reindentedTsCode = '\n' + trimmedCompiledTsCode.split('\n').map(line => `${indentString}${line}`).join('\n') + '\n';
       
       const langAttrLengthChange = (langValueStart !== -1) ? ('ts'.length - (langValueEnd - langValueStart)) : 0;
-      const contentLenghtChange = reindentedTsCode.length - (end - start);
+      const contentLengthChange = reindentedTsCode.length - (end - start);
       
       // Perform overwrites now that all calculations are done.
       if (langValueStart !== -1) {
@@ -166,7 +157,7 @@ ${tsCode}`);
       const tsLineCount = reindentedTsCode.split('\n').length;
 
       // Build per-line indent table (uniform for now but future-proof)
-      const removedIndentPerLine = Array.from({ length: tsLineCount }, () => indentLen);
+      // const removedIndentPerLine = Array.from({ length: tsLineCount }, () => indentLen); <-- REMOVED: This is redundant as mapChainer falls back to commonLength.
       
       const blockData: BlockInfo = {
         map: mapFromNormalize,
@@ -186,10 +177,8 @@ ${tsCode}`);
         },
         sourceIndent: {
             commonLength: indentLen,
-            perLineLengths: removedIndentPerLine
+            perLineLengths: undefined
         },
-        /** Include raw mapping lines from the Civet compiler */
-        rawMapLines: civetMapRaw.lines,
       };
 
       if (isModule) {
@@ -198,7 +187,7 @@ ${tsCode}`);
         result.instance = blockData;
       }
 
-      offsetShift += langAttrLengthChange + contentLenghtChange;
+      offsetShift += langAttrLengthChange + contentLengthChange;
 
     } catch (err: any) {
         if (err.name === 'ParseError' && typeof err.offset === 'number') {
