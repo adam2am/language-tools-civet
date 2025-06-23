@@ -4,8 +4,8 @@ import { parse as svelteParse } from 'svelte/compiler';
 import { compileCivet } from './compiler';
 import { normalizeCivetMap } from './sourcemap';
 import { getAttributeValue, getActualContentStartLine, stripCommonIndent } from './helpers';
-import type { PreprocessResult, CivetBlockInfo } from './types';
-import { loadCivetCompileOptionsSync } from './config';
+import type { ProcessResult, BlockInfo } from './types';
+import { loadCompileOpts } from './config';
 
 const civetPreprocessorDebug = false;
 
@@ -31,19 +31,19 @@ function offsetToPosition(text: string, offset: number): { line: number; column:
  * into TypeScript and normalizing their sourcemaps.
  */
 export function preprocessCivet(
-    svelte: string,
+    svelteCode: string,
     filename: string,
     parse: typeof svelteParse = svelteParse,
     civetModule?: typeof import('@danielx/civet')
-): PreprocessResult {
-  const ms = new MagicString(svelte);
-  const { tags } = parseHtmlxOriginal(svelte, parse, {
+): ProcessResult {
+  const magic = new MagicString(svelteCode);
+  const { tags } = parseHtmlxOriginal(svelteCode, parse, {
     emitOnTemplateError: false,
     svelte5Plus: true
   });
-  const result: PreprocessResult = { code: svelte };
+  const result: ProcessResult = { code: svelteCode };
 
-  let cumulativeOffsetShift = 0;
+  let offsetShift = 0;
 
   for (const tag of tags) {
     if (tag.type !== 'Script') continue;
@@ -52,11 +52,11 @@ export function preprocessCivet(
 
     const start = tag.content.start; // Offset in the *original* svelte string.
     const end = tag.content.end;
-    const snippet = svelte.slice(start, end).replace(/\s+$/, '');
+    const snippet = svelteCode.slice(start, end).replace(/\s+$/, '');
     
     // Remove leading blank lines to avoid offset mismatches
-    const snippetTrimmed = snippet.replace(/^(?:[ \t]*[\r\n])+/, '');
-    const { dedented: dedentedSnippet, indent: removedIndentString } = stripCommonIndent(snippetTrimmed);
+    const trimmed = snippet.replace(/^(?:[ \t]*[\r\n])+/,'');
+    const { dedented: content, indent: indentStr } = stripCommonIndent(trimmed);
 
     try {
       const context = getAttributeValue(tag.attributes, 'context');
@@ -83,18 +83,18 @@ ${snippet}`);
       }
 
       // Dedent the trimmed snippet to strip common leading whitespace for accurate mapping
-      const commonIndentLength = removedIndentString.length;
+      const indentLen = indentStr.length;
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] Civet snippet after dedent:
-${dedentedSnippet}`);
-      if (civetPreprocessorDebug) console.log(`[preprocessCivet] Dedented snippet content:\n${dedentedSnippet}`);
+${content}`);
+      if (civetPreprocessorDebug) console.log(`[preprocessCivet] Dedented snippet content:\n${content}`);
       
 
       // Discover user Civet configuration synchronously so the LS respects parseOptions
-      const civetCompileOptions = loadCivetCompileOptionsSync(filename);
+      const civetCompileOptions = loadCompileOpts(filename);
 
       // Compile Civet to TS and get raw sourcemap from dedented snippet
-      const { code: compiledTsCode, rawMap } = compileCivet(
-        dedentedSnippet,
+      const { code: tsCode, rawMap: civetMapRaw } = compileCivet(
+        content,
         filename,
         {
           civetModule,
@@ -102,10 +102,10 @@ ${dedentedSnippet}`);
         }
       );
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] Compiled TS code from Civet:
-${compiledTsCode}`);
-      if (civetPreprocessorDebug) console.log(`[preprocessCivet] compileCivet output code length: ${compiledTsCode.length}, rawMap lines count: ${rawMap && 'lines' in rawMap ? rawMap.lines.length : 0}`);
+${tsCode}`);
+      if (civetPreprocessorDebug) console.log(`[preprocessCivet] compileCivet output code length: ${tsCode.length}, rawMap lines count: ${civetMapRaw && 'lines' in civetMapRaw ? civetMapRaw.lines.length : 0}`);
 
-      if (!rawMap || !('lines' in rawMap)) {
+      if (!civetMapRaw || !('lines' in civetMapRaw)) {
           // Skip any mutation of this <script> block so that the original source
           // (including the original indent/whitespace) stays intact. This
           // avoids accidental position shifts when Civet compilation fails or
@@ -115,35 +115,35 @@ ${compiledTsCode}`);
 
       // Add a dummy trailing segment to each rawMap line to help IDE reference-boundary detection
       // This is a pure generated-column delta ([1]) and will not produce its own mapping.
-      (rawMap.lines as number[][][]).forEach(lineSegments => {
+      (civetMapRaw.lines as number[][][]).forEach(lineSegments => {
         lineSegments.push([1]);
       });
 
       // Compute line offset for snippet within the Svelte file dynamically by finding first content line
-      const originalContentStartLine_1based = getActualContentStartLine(svelte, start);
-      const originalCivetSnippetLineOffset_0based = originalContentStartLine_1based - 1;
+      const civetContentStartLine = getActualContentStartLine(svelteCode, start);
+      const civetSnippetStartLineIndex = civetContentStartLine - 1;
 
-      if (civetPreprocessorDebug) console.log(`[preprocessCivet] Civet snippet offsets ${start}-${end} -> Svelte line ${originalContentStartLine_1based}`);
+      if (civetPreprocessorDebug) console.log(`[preprocessCivet] Civet snippet offsets ${start}-${end} -> Svelte line ${civetContentStartLine}`);
 
-      if (civetPreprocessorDebug) console.log(`[preprocessCivet] originalContentStartLine_1based: ${originalContentStartLine_1based}, snippet offset (0-based): ${originalCivetSnippetLineOffset_0based}`);
+      if (civetPreprocessorDebug) console.log(`[preprocessCivet] originalContentStartLine_1based: ${civetContentStartLine}, snippet offset (0-based): ${civetSnippetStartLineIndex}`);
 
 
       // Normalize the Civet sourcemap to a standard V3 map
       const mapFromNormalize = normalizeCivetMap(
-        rawMap,
-        svelte,
-        originalContentStartLine_1based,
-        commonIndentLength,
+        civetMapRaw,
+        svelteCode,
+        civetContentStartLine,
+        indentLen,
         filename,
-        compiledTsCode
+        tsCode
       );
       // Debug: log first segment of normalized map mappings
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] normalized map first semicolon segment: ${mapFromNormalize.mappings.split(';')[0]}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] normalizeCivetMap returned map mappings length: ${mapFromNormalize.mappings.split(';').length}`);
 
       // --- Rewrite the Svelte file content ---
-      const indentString = removedIndentString;
-      const trimmedCompiledTsCode = compiledTsCode.replace(/\r?\n+$/g, '');
+      const indentString = indentStr;
+      const trimmedCompiledTsCode = tsCode.replace(/\r?\n+$/g, '');
       const reindentedTsCode = '\n' + trimmedCompiledTsCode.split('\n').map(line => `${indentString}${line}`).join('\n') + '\n';
       
       const langAttrLengthChange = (langValueStart !== -1) ? ('ts'.length - (langValueEnd - langValueStart)) : 0;
@@ -151,38 +151,46 @@ ${compiledTsCode}`);
       
       // Perform overwrites now that all calculations are done.
       if (langValueStart !== -1) {
-          ms.overwrite(langValueStart, langValueEnd, 'ts');
+          magic.overwrite(langValueStart, langValueEnd, 'ts');
       }
-      ms.overwrite(start, end, reindentedTsCode);
+      magic.overwrite(start, end, reindentedTsCode);
 
       // --- Calculate final positions and build block data ---
       // The start of the script block in the *final string* is its original `start`
       // plus all shifts from previous blocks.
-      const blockStartInFinalString = start + cumulativeOffsetShift;
+      const blockStartInOutput = start + offsetShift;
       // The TS code content starts after the lang attribute has potentially changed length.
-      const tsContentStartInFinalString = blockStartInFinalString + langAttrLengthChange;
+      const tsCodeStartInOutput = blockStartInOutput + langAttrLengthChange;
 
-      const originalScriptBlockLineCount = svelte.slice(start, end).split('\n').length;
-      const compiledTsLineCount = reindentedTsCode.split('\n').length;
+      const civetLineCount = svelteCode.slice(start, end).split('\n').length;
+      const tsLineCount = reindentedTsCode.split('\n').length;
 
       // Build per-line indent table (uniform for now but future-proof)
-      const removedIndentPerLine = Array.from({ length: compiledTsLineCount }, () => commonIndentLength);
+      const removedIndentPerLine = Array.from({ length: tsLineCount }, () => indentLen);
       
-      const blockData = {
-        map: mapFromNormalize as any, // Cast to any to bypass complex type issue for now, assuming structure is EncodedSourceMap compatible
-        // The actual code starts after the leading newline and indent.
-        tsStartInSvelteWithTs: tsContentStartInFinalString + 1 + commonIndentLength,
-        // The end is the start of the new content plus its length.
-        tsEndInSvelteWithTs: tsContentStartInFinalString + reindentedTsCode.length,
-        originalContentStartLine: originalContentStartLine_1based,
-        originalCivetLineCount: originalScriptBlockLineCount,
-        compiledTsLineCount,
+      const blockData: BlockInfo = {
+        map: mapFromNormalize,
+        tsSnippet: {
+            startOffset: tsCodeStartInOutput + 1 + indentLen,
+            endOffset: tsCodeStartInOutput + reindentedTsCode.length,
+        },
+        civet: {
+            lineCount: civetLineCount,
+        },
+        ts: {
+            lineCount: tsLineCount,
+        },
+        svelte: {
+            civetStartLine: civetContentStartLine,
+            civetStartIndex: civetSnippetStartLineIndex,
+        },
+        sourceIndent: {
+            commonLength: indentLen,
+            perLineLengths: removedIndentPerLine
+        },
         /** Include raw mapping lines from the Civet compiler */
-        rawMapLines: rawMap.lines,
-        originalCivetSnippetLineOffset_0based,
-        removedCivetContentIndentLength: commonIndentLength,
-        removedIndentPerLine
-      } as CivetBlockInfo;
+        rawMapLines: civetMapRaw.lines,
+      };
 
       if (isModule) {
         result.module = blockData;
@@ -190,7 +198,7 @@ ${compiledTsCode}`);
         result.instance = blockData;
       }
 
-      cumulativeOffsetShift += langAttrLengthChange + contentLenghtChange;
+      offsetShift += langAttrLengthChange + contentLenghtChange;
 
     } catch (err: any) {
         if (err.name === 'ParseError' && typeof err.offset === 'number') {
@@ -208,22 +216,22 @@ ${compiledTsCode}`);
             // --- Approach 2: If the failing character is whitespace (space, tab, newline, CR), walk left until non-whitespace or start of file.
             let adjustedOffset = err.offset;
             const isWs = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
-            if (isWs(dedentedSnippet[adjustedOffset])) {
-                while (adjustedOffset > 0 && isWs(dedentedSnippet[adjustedOffset])) {
+            if (isWs(content[adjustedOffset])) {
+                while (adjustedOffset > 0 && isWs(content[adjustedOffset])) {
                     adjustedOffset--;
                 }
             }
 
-            const { line: relLine, column: relCol } = offsetToPosition(dedentedSnippet, adjustedOffset);
+            const { line: relLine, column: relCol } = offsetToPosition(content, adjustedOffset);
 
             // Where did the snippet actually start in the Svelte file?
-            const originalContentStartLine = getActualContentStartLine(svelte, tag.content.start); // 1-based
+            const civetContentStartLineForError = getActualContentStartLine(svelteCode, tag.content.start); // 1-based
 
-            const absoluteLine   = originalContentStartLine + relLine  - 1; // 1-based
-            const absoluteColumn = removedIndentString.length + relCol - 1;    // convert relCol (1-based) to 0-based within full Svelte file
+            const absoluteLine   = civetContentStartLineForError + relLine  - 1; // 1-based
+            const absoluteColumn = indentStr.length + relCol - 1;    // convert relCol (1-based) to 0-based within full Svelte file
 
             const width = 4; // highlight up to four characters for visibility
-            const lineText = svelte.split(/\r?\n/)[absoluteLine - 1] || '';
+            const lineText = svelteCode.split(/\r?\n/)[absoluteLine - 1] || '';
 
             let highlightStart = absoluteColumn;
             let highlightEnd   = Math.min(absoluteColumn + width, lineText.length);
@@ -281,7 +289,7 @@ ${compiledTsCode}`);
             niceMsg = niceMsg.replace(/\s*ts\(-1\)\s*$/, '');
 
             // Adjust the displayed line number so that it counts from the <script> tag start (visual line)
-            const visualOffset = originalContentStartLine - 1; // total lines above first Civet code
+            const visualOffset = civetContentStartLineForError - 1; // total lines above first Civet code
             if (visualOffset > 0) {
                 // Add visualOffset to the displayed line number (message only)
                 niceMsg = niceMsg.replace(/^(.*?:)(\d+)(:)(\d+)/, (_m, p1, ln, sep, col) => `${p1}${Number(ln) + visualOffset}${sep}${col}`);
@@ -300,6 +308,6 @@ ${compiledTsCode}`);
     }
   }
 
-  result.code = ms.toString();
+  result.code = magic.toString();
   return result;
 } 

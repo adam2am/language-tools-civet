@@ -1,21 +1,21 @@
 import type { SourceMap as CivetSourceMapClass } from '@danielx/civet';
-import type { CivetCompileResult, CivetOutputMap, StandardRawSourceMap, CivetLinesSourceMap } from './types';
+import type { CompileResult, CivetMap, RawMap, LinesMap } from './types';
 
-const civetCompilerDebug = false;
+const debug = false;
 
 // Dynamically load the Civet compiler to make it optional
-let _civetModule: typeof import('@danielx/civet') | null | undefined;
-function getCivetModule(): typeof import('@danielx/civet') | null {
-  if (_civetModule !== undefined) return _civetModule;
+let moduleCache: typeof import('@danielx/civet') | null | undefined;
+function getModule(): typeof import('@danielx/civet') | null {
+  if (moduleCache !== undefined) return moduleCache;
   try {
     // Use require to allow optional dependency
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    _civetModule = require('@danielx/civet');
+    moduleCache = require('@danielx/civet');
   } catch (e) {
     console.warn('[compileCivet] @danielx/civet not found, skipping Civet compilation');
-    _civetModule = null;
+    moduleCache = null;
   }
-  return _civetModule;
+  return moduleCache;
 }
 
 /**
@@ -36,18 +36,18 @@ export function compileCivet(
      */
     civetCompileOptions?: Record<string, any>;
   }
-): CivetCompileResult {
-  const civet = options?.civetModule ?? getCivetModule();
+): CompileResult {
+  const civet = options?.civetModule ?? getModule();
   if (!civet) {
     // No Civet compiler available, return original code and no map
     return { code: snippet, rawMap: undefined };
   }
-  if (civetCompilerDebug) {
+  if (debug) {
     console.log(`[compileCivet-debug] Compiling Civet snippet for file: ${filename}`);
     console.log(`[compileCivet-debug] Snippet content:\n${snippet}`);
   }
 
-  const baseCompileOpts = {
+  const defaultOpts = {
     js: false,
     sourceMap: true,
     inlineMap: false,
@@ -57,50 +57,50 @@ export function compileCivet(
   } as Record<string, any>;
 
   // ---- Merge caller provided options -------------------------------------------
-  const userCompileOpts = options?.civetCompileOptions ?? {};
+  const userOpts = options?.civetCompileOptions ?? {};
 
   // Final options sent to `civet.compile`.
-  const compileOpts = {
-    ...baseCompileOpts,
-    ...userCompileOpts
+  const opts = {
+    ...defaultOpts,
+    ...userOpts
   };
 
-  let civetResult: { code: string; sourceMap?: CivetSourceMapClass };
+  let result: { code: string; sourceMap?: CivetSourceMapClass };
   try {
-    civetResult = (civet.compile as any)(snippet, compileOpts);
+    result = (civet.compile as any)(snippet, opts);
   } catch (err: any) {
     const partial = err?.partial || err?.partialResult;
     if (partial && partial.code) {
       // Civet threw but provided partial output (different versions expose 'partial' or 'partialResult')
-      civetResult = partial as { code: string; sourceMap?: CivetSourceMapClass };
+      result = partial as { code: string; sourceMap?: CivetSourceMapClass };
     } else {
       throw err;
     }
   }
 
-  if ((compileOpts as any).errors && (compileOpts as any).errors.length > 0) {
+  if ((opts as any).errors && (opts as any).errors.length > 0) {
     // Throw the first parse error. preprocessCivet is set up to handle it.
-    throw (compileOpts as any).errors[0];
+    throw (opts as any).errors[0];
   }
 
-  if (civetCompilerDebug) {
-    console.log(`[compileCivet-debug] Civet.compile returned code length: ${civetResult.code.length}`);
-    console.log(`[compileCivet-debug] Civet.compile code snippet prefix: ${civetResult.code.slice(0, 100).replace(/\n/g, '\\n')}...`);
+  if (debug) {
+    console.log(`[compileCivet-debug] Civet.compile returned code length: ${result.code.length}`);
+    console.log(`[compileCivet-debug] Civet.compile code snippet prefix: ${result.code.slice(0, 100).replace(/\n/g, '\\n')}...`);
   }
 
-  let finalMap: CivetOutputMap | undefined = undefined;
+  let rawMap: CivetMap | undefined = undefined;
 
-  if (civetResult.sourceMap) {
+  if (result.sourceMap) {
     if (options?.outputStandardV3Map === true) {
-      finalMap = civetResult.sourceMap.json(filename, filename) as StandardRawSourceMap;
+      rawMap = result.sourceMap.json(filename, filename) as RawMap;
     } else {
-      finalMap = civetResult.sourceMap as unknown as CivetLinesSourceMap;
+      rawMap = result.sourceMap as unknown as LinesMap;
     }
-    if (civetCompilerDebug) console.log(`[compileCivet-debug] rawMap type: ${finalMap && 'lines' in finalMap ? 'CivetLinesSourceMap' : 'StandardRawSourceMap'}`);
+    if (debug) console.log(`[compileCivet-debug] rawMap type: ${rawMap && 'lines' in rawMap ? 'LinesMap' : 'RawMap'}`);
   }
 
   return {
-    code: civetResult.code,
-    rawMap: finalMap
+    code: result.code,
+    rawMap
   };
 } 

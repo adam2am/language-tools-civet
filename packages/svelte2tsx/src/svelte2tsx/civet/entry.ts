@@ -1,14 +1,14 @@
 import { preprocessCivet } from './preprocessor';
-import { chainMaps, EnhancedChainBlock, EncodedSourceMap as ChainEncodedMap } from './mapChainer';
+import { chainMaps, ChainBlock, EncodedSourceMap as ChainEncodedMap } from './mapChainer';
 import { getLineAndColumnForOffset } from './helpers';
-import type { PreprocessResult, CivetBlockInfo } from './types';
+import type { ProcessResult, BlockInfo } from './types';
 
 /** Result returned by maybePreprocessCivet */
 export interface MaybePreprocessResult {
     /** Svelte code with any Civet converted to TS (or original code if none) */
     code: string;
     /** Normalised Civet block data ready for map chaining */
-    civetBlocks: EnhancedChainBlock[];
+    civetBlocks: ChainBlock[];
 }
 
 /**
@@ -27,27 +27,37 @@ export function maybePreprocessCivet(
     }
 
     // Run the existing Civet preprocessor
-    const preRes: PreprocessResult = preprocessCivet(svelte, filename || '', parse, civetModule);
+    const preRes: ProcessResult = preprocessCivet(svelte, filename || '', parse, civetModule);
 
-    const civetBlocks: EnhancedChainBlock[] = [];
+    const civetBlocks: ChainBlock[] = [];
 
-    const addBlock = (info?: CivetBlockInfo) => {
+    const addBlock = (info?: BlockInfo) => {
         if (!info) return;
-        const { line: startLine, column: startCol } = getLineAndColumnForOffset(preRes.code, info.tsStartInSvelteWithTs);
-        const { line: endLine } = getLineAndColumnForOffset(preRes.code, info.tsEndInSvelteWithTs);
+        const { line: startLine, column: startCol } = getLineAndColumnForOffset(preRes.code, info.tsSnippet.startOffset);
+        const { line: endLine } = getLineAndColumnForOffset(preRes.code, info.tsSnippet.endOffset);
         civetBlocks.push({
-            map: info.map as any, // Already a normalised EncodedSourceMap
-            tsStartCharInSvelteWithTs: info.tsStartInSvelteWithTs,
-            tsEndCharInSvelteWithTs: info.tsEndInSvelteWithTs,
-            tsStartLineInSvelteWithTs: startLine,
-            tsStartColInSvelteWithTs: startCol,
-            tsEndLineInSvelteWithTs: endLine,
-            originalCivetLineCount: info.originalCivetLineCount,
-            compiledTsLineCount: info.compiledTsLineCount,
-            originalCivetSnippetLineOffset_0based: (info as any).originalCivetSnippetLineOffset_0based ?? 0,
-            removedCivetContentIndentLength: (info as any).removedCivetContentIndentLength ?? 0,
-            removedIndentPerLine: (info as any).removedIndentPerLine,
-            originalContentStartLine_Svelte_1based: info.originalContentStartLine
+            map: info.map as ChainEncodedMap,
+            tsSnippet: {
+                startOffset: info.tsSnippet.startOffset,
+                endOffset: info.tsSnippet.endOffset,
+                startLine: startLine,
+                startCol: startCol,
+                endLine: endLine,
+            },
+            civet: {
+                lineCount: info.civet.lineCount,
+            },
+            ts: {
+                lineCount: info.ts.lineCount,
+            },
+            svelte: {
+                civetStartLine: info.svelte.civetStartLine,
+                civetStartIndex: info.svelte.civetStartIndex ?? 0,
+            },
+            sourceIndent: {
+                commonLength: info.sourceIndent?.commonLength ?? 0,
+                perLineLengths: info.sourceIndent?.perLineLengths,
+            },
         });
     };
 
@@ -55,7 +65,7 @@ export function maybePreprocessCivet(
     addBlock(preRes.instance);
 
     // Sort to guarantee ascending start offset order (required for chainMaps)
-    civetBlocks.sort((a, b) => a.tsStartCharInSvelteWithTs - b.tsStartCharInSvelteWithTs);
+    civetBlocks.sort((a, b) => a.tsSnippet.startOffset - b.tsSnippet.startOffset);
 
     return { code: preRes.code, civetBlocks };
 }
@@ -67,14 +77,14 @@ export function maybePreprocessCivet(
  */
 export function chainAllCivetBlocks(
     baseMap: ChainEncodedMap,
-    civetBlocks: EnhancedChainBlock[],
+    civetBlocks: ChainBlock[],
     originalSvelte: string,
     svelteWithTs: string
 ): ChainEncodedMap {
     if (!civetBlocks || civetBlocks.length === 0) {
         return baseMap;
     }
-    return chainMaps(baseMap as any, civetBlocks, originalSvelte, svelteWithTs);
+    return chainMaps(baseMap, civetBlocks, originalSvelte, svelteWithTs);
 }
 
 export {}; 

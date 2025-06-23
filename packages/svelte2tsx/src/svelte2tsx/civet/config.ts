@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 /** Standard config filenames (in search order, without path) */
-const CONFIG_CANDIDATES = [
+const CONFIG_FILES = [
   '🐈.json',
   'civetconfig.json',
   'civet.config.json',
@@ -21,7 +21,7 @@ const CONFIG_CANDIDATES = [
   'package.json'
 ];
 
-interface CachedConfigEntry {
+interface ConfigCache {
   options: Record<string, unknown>;
   /** Path of the config file that produced these options (undefined → none found) */
   path?: string;
@@ -30,10 +30,10 @@ interface CachedConfigEntry {
 }
 
 /** Cache of discovered configs keyed by directory */
-const cache = new Map<string, CachedConfigEntry>();
+const dirCache = new Map<string, ConfigCache>();
 
 /** Attempt to synchronously load a config object from the given file. */
-function loadConfigFileSync(filePath: string): Record<string, unknown> | undefined {
+function loadConfig(filePath: string): Record<string, unknown> | undefined {
   const ext = path.extname(filePath).toLowerCase();
   try {
     if (ext === '.json') {
@@ -66,11 +66,11 @@ function loadConfigFileSync(filePath: string): Record<string, unknown> | undefin
 }
 
 /** Walk up directory tree from startDir searching for a Civet config file. */
-function findConfigSync(startDir: string): string | undefined {
+function findConfig(startDir: string): string | undefined {
   let dir = path.resolve(startDir);
   while (true) {
     // 1. Check dir candidates
-    for (const name of CONFIG_CANDIDATES) {
+    for (const name of CONFIG_FILES) {
       const candidate = path.join(dir, name);
       if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
         return candidate;
@@ -92,13 +92,13 @@ function findConfigSync(startDir: string): string | undefined {
  * Synchronously discover and load Civet compile options for a source file.
  * Returns an object suitable to spread into civet.compile options.
  */
-export function loadCivetCompileOptionsSync(filePath: string): Record<string, unknown> {
+export function loadCompileOpts(filePath: string): Record<string, unknown> {
   const directory = path.dirname(filePath);
 
   // Discover current config path (may be undefined)
-  const discoveredPath = findConfigSync(directory);
+  const discoveredPath = findConfig(directory);
 
-  const cached = cache.get(directory);
+  const cached = dirCache.get(directory);
   if (cached) {
     // If the path is unchanged, check mtime
     if (cached.path === discoveredPath) {
@@ -119,17 +119,17 @@ export function loadCivetCompileOptionsSync(filePath: string): Record<string, un
 
   // Need to (re)load because either path changed or mtime changed or no cache.
   if (!discoveredPath) {
-    cache.set(directory, { options: {}, path: undefined, mtime: undefined });
+    dirCache.set(directory, { options: {}, path: undefined, mtime: undefined });
     return {};
   }
 
-  const cfg = loadConfigFileSync(discoveredPath) ?? {};
+  const cfg = loadConfig(discoveredPath) ?? {};
   let mtimeVal: number | undefined;
   try {
     mtimeVal = fs.statSync(discoveredPath).mtimeMs;
   } catch {
     mtimeVal = undefined;
   }
-  cache.set(directory, { options: cfg as Record<string, unknown>, path: discoveredPath, mtime: mtimeVal });
+  dirCache.set(directory, { options: cfg as Record<string, unknown>, path: discoveredPath, mtime: mtimeVal });
   return cfg as Record<string, unknown>;
 } 
