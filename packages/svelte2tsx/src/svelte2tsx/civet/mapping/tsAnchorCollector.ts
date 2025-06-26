@@ -10,7 +10,7 @@ export interface Anchor {
     kind: 'identifier' | 'stringLiteral' | 'numericLiteral' | 'operator';
 }
 
-export function collectTsAnchors(
+export function collectAnchorsFromTs(
     tsCode: string,
     svelteFilePath: string,
     OPERATOR_MAP: Record<string, string>

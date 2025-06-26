@@ -1,27 +1,6 @@
 import { traceSegment, TraceMap } from "@jridgewell/trace-mapping";
 
-export class LineCalc {
-    private lineOffsets: number[];
-    constructor(content: string) {
-        this.lineOffsets = [0]; // First line starts at offset 0
-        for (let i = 0; i < content.length; i++) {
-            if (content[i] === '\n') {
-                this.lineOffsets.push(i + 1);
-            }
-        }
-    }
-  
-    getOffset(line1Based: number, col0Based: number): number {
-        if (line1Based < 1 || line1Based > this.lineOffsets.length) {
-            console.warn(`[LineOffsetCalculator] Line ${line1Based} out of bounds (1-${this.lineOffsets.length}). Clamping.`);
-            line1Based = Math.max(1, Math.min(line1Based, this.lineOffsets.length));
-        }
-        const lineStartOffset = this.lineOffsets[line1Based - 1];
-        return lineStartOffset + col0Based;
-    }
-}
-
-export function remapScriptSegments(
+export function mapScriptSegments(
     codeSegs: { segment: number[]; charOffset: number; blockIndex: number }[],
     blocks: any[], // Use a more specific type if available
     tracers: TraceMap[],
@@ -41,13 +20,13 @@ export function remapScriptSegments(
         // code was inserted back into the <script> block. Most of the time this is the
         // uniform `block.sourceIndent.commonLength`, but if a per-line table is provided we
         // use that for higher accuracy / uneven indents.
-        const indentRemovedForThisLine =
+        const indentShift =
           (block.sourceIndent.perLineLengths &&
            tracerLine < block.sourceIndent.perLineLengths.length)
             ? block.sourceIndent.perLineLengths[tracerLine]
             : block.sourceIndent.commonLength;
   
-        const tracerCol = preprocessedCol - indentRemovedForThisLine;
+        const tracerCol = preprocessedCol - indentShift;
   
         let traced: readonly number[] | null = null;
         try {
@@ -106,27 +85,4 @@ export function remapScriptSegments(
         }
       }
       return codeLines;
-}
-
-export function remapTemplateSegments(
-    tmplSegs: { segment: number[]; charOffset: number }[],
-    blocks: any[], // Use a more specific type if available
-    lineDeltas: number[]
-): number[][] {
-    const tmplLines: number[][] = [];
-    for (const { segment, charOffset } of tmplSegs) {
-        const [generatedCol, , preprocessedLine, preprocessedCol, nameIndex] = segment;
-        let delta = 0;
-        for (let k = 0; k < blocks.length; k++) {
-            if (charOffset < blocks[k].tsSnippet.startOffset) {
-                delta = lineDeltas[k];
-                break;
-            }
-            delta = lineDeltas[k + 1];
-        }
-        tmplLines.push([generatedCol, 0, preprocessedLine - delta, preprocessedCol, nameIndex].filter(n => n !== undefined) as number[]);
-    }
-    return tmplLines;
-}
-
-export {}; 
+} 

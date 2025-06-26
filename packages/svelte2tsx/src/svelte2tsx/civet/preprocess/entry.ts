@@ -1,7 +1,7 @@
 import { preprocessCivet } from './preprocessor';
-import { chainMaps, ChainBlock, EncodedSourceMap as ChainEncodedMap } from './mapChainer';
-import { getLineAndColumnForOffset } from './helpers';
-import type { ProcessResult, BlockInfo } from './types';
+import { chainCivetMaps, ChainBlock, ChainedSourceMap as ChainEncodedMap } from '../mapping/chainer';
+import { getLineAndColumnForOffset } from '../util/htmlx';
+import type { ProcessResult, BlockInfo } from '../types';
 
 /** Result returned by maybePreprocessCivet */
 export interface MaybePreprocessResult {
@@ -64,7 +64,7 @@ export function maybePreprocessCivet(
     addBlock(preRes.module);
     addBlock(preRes.instance);
 
-    // Sort to guarantee ascending start offset order (required for chainMaps)
+    // Sort to guarantee ascending start offset order (required for chainCivetMaps)
     civetBlocks.sort((a, b) => a.tsSnippet.startOffset - b.tsSnippet.startOffset);
 
     return { code: preRes.code, civetBlocks };
@@ -84,7 +84,7 @@ export function chainAllCivetBlocks(
     if (!civetBlocks || civetBlocks.length === 0) {
         return baseMap;
     }
-    return chainMaps(baseMap, civetBlocks, originalSvelte, svelteWithTs);
+    return chainCivetMaps(baseMap, civetBlocks, originalSvelte, svelteWithTs);
 }
 
 export {}; 

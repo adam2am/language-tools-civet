@@ -1,11 +1,12 @@
 import MagicString from 'magic-string';
-import { parseHtmlx as parseHtmlxOriginal } from '../../utils/htmlxparser';
+import { parseHtmlx as parseHtmlxOriginal } from '../../../utils/htmlxparser';
 import { parse as svelteParse } from 'svelte/compiler';
-import { compileCivet } from './compiler';
-import { normalizeCivetMap } from './sourcemap';
-import { getAttributeValue, getActualContentStartLine, stripCommonIndent } from './helpers';
-import type { ProcessResult, BlockInfo } from './types';
-import { loadCompileOpts } from './config';
+import { compileCivet } from '../compile/compiler';
+import { normalizeCivetMap } from '../mapping/normalizer';
+import { getAttributeValue, getActualContentStartLine } from '../util/htmlx';
+import { stripCommonIndent } from '../util/string';
+import type { ProcessResult, BlockInfo } from '../types';
+import { loadCompileOpts } from '../compile/config';
 
 const civetPreprocessorDebug = false;
 

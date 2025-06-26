@@ -1,5 +1,5 @@
 import type { SourceMap as CivetSourceMapClass } from '@danielx/civet';
-import type { CompileResult, CivetMap, RawMap, LinesMap } from './types';
+import type { CompileResult, CivetMap, RawMap, LinesMap } from '../types';
 
 const debug = false;
 

@@ -1,4 +1,4 @@
-export { preprocessCivet } from './preprocessor';
-export { getLineAndColumnForOffset } from './helpers';
-export { chainMaps } from './mapChainer';
-export { maybePreprocessCivet, chainAllCivetBlocks } from './entry';
+export { preprocessCivet } from './preprocess/preprocessor';
+export { getLineAndColumnForOffset } from './util/htmlx';
+export { chainCivetMaps } from './mapping/chainer/index';
+export { maybePreprocessCivet, chainAllCivetBlocks } from './preprocess/entry';

@@ -1,19 +1,19 @@
 // import { GenMapping, setSourceContent, addMapping, toEncodedMap } from '@jridgewell/gen-mapping';
 import type { EncodedSourceMap } from '@jridgewell/gen-mapping';
-import type { LinesMap } from './types';
+import type { LinesMap } from '../types';
 import * as ts from 'typescript';
-import { Anchor, collectTsAnchors } from './sourcemap-logic';
+import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
 // avoid unused-import linter errors
 if (ts) { /* noop */ }
 
-function findOriginalPosition(
+function locateTokenInCivetLine(
   anchor: Anchor,
   civetLineText: string,
   consumedCount: number,
-  OPERATOR_MAP: Record<string, string>,
+  operatorLookup: Record<string, string>,
   debug: boolean
 ): number | undefined {
-  const searchText = anchor.kind === 'operator' ? (OPERATOR_MAP[anchor.text] || anchor.text) : anchor.text;
+  const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
   let foundIndex = -1;
 
   if (debug) {
@@ -73,7 +73,7 @@ function findOriginalPosition(
   return foundIndex !== -1 ? foundIndex : undefined;
 }
 
-function prepareMappingData(
+function buildLookupTables(
   tsAnchors: Anchor[],
   civetMap: LinesMap,
   civetCodeLines: string[]
@@ -118,18 +118,18 @@ function prepareMappingData(
   return { tsLineToCivetLineMap, generatedIdentifiers, anchorsByLine, names };
 }
 
-function generateDecodedMappings(
+function buildDenseMapLines(
   tsLines: string[],
   anchorsByLine: Map<number, Anchor[]>,
   generatedIdentifiers: Set<string>,
   tsLineToCivetLineMap: Map<number, number>,
   civetCodeLines: string[],
-  OPERATOR_MAP: Record<string, string>,
+  operatorLookup: Record<string, string>,
   civetBlockStartLine: number,
   indentation: number,
   names: string[],
-  debugDenseMap: boolean,
-  debugTokenMapping: boolean
+  DEBUG_DENSE_MAP: boolean,
+  DEBUG_TOKEN: boolean
 ) {
   const decoded: number[][][] = [];
   const consumedMatchCount = new Map<string, number>();
@@ -142,7 +142,7 @@ function generateDecodedMappings(
     for (const anchor of lineAnchors) {
       // --- Fill gap before this token with a null mapping ---
       if (anchor.start.character > lastGenCol) {
-        if (debugDenseMap) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol}`);
+        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol}`);
         lineSegments.push([0]);
       }
 
@@ -153,28 +153,28 @@ function generateDecodedMappings(
       }
 
       if (isGenerated) {
-        if (debugDenseMap) console.log(`[DENSE_MAP_NULL] Generated token '${anchor.text}' at ${i}:${anchor.start.character}`);
+        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Generated token '${anchor.text}' at ${i}:${anchor.start.character}`);
         lineSegments.push([0]);
         lastGenCol = anchor.end.character;
-        if (debugDenseMap) console.log(`[RANGE_DEBUG] GEN-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
+        if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] GEN-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
         continue;
       }
 
       // It's not a known generated token, so try to find its original position.
       const civetLineIndex = tsLineToCivetLineMap.get(i);
       if (civetLineIndex === undefined) {
-        if (debugDenseMap) console.log(`[DENSE_MAP_NULL] No civet line for TS line ${i}, null mapping token '${anchor.text}'`);
+        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] No civet line for TS line ${i}, null mapping token '${anchor.text}'`);
         lineSegments.push([0]);
         lastGenCol = anchor.end.character;
         continue;
       }
 
       const civetLineText = civetCodeLines[civetLineIndex] || '';
-      const searchText = anchor.kind === 'operator' ? (OPERATOR_MAP[anchor.text] || anchor.text) : anchor.text;
+      const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
       const cacheKey = `${civetLineIndex}:${searchText}`;
       const consumedCount = consumedMatchCount.get(cacheKey) || 0;
       
-      const civetColumn = findOriginalPosition(anchor, civetLineText, consumedCount, OPERATOR_MAP, debugDenseMap);
+      const civetColumn = locateTokenInCivetLine(anchor, civetLineText, consumedCount, operatorLookup, DEBUG_DENSE_MAP);
 
       if (civetColumn !== undefined) {
         consumedMatchCount.set(cacheKey, consumedCount + 1);
@@ -201,7 +201,7 @@ function generateDecodedMappings(
         // Add NULL mapping for whitespace after token
         lineSegments.push([0, 0, sourceSvelteLine, sourceSvelteEndColExclusive + 1]);
 
-        if (debugTokenMapping && anchor.text === 'abc') {
+        if (DEBUG_TOKEN && anchor.text === 'abc') {
             console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
             console.log(`- Token length: ${tokenLength}`);
             console.log(`- TS Start: Column ${anchor.start.character}`);
@@ -212,7 +212,7 @@ function generateDecodedMappings(
         }
       } else {
         // Could not find in original line, treat as generated.
-        if (debugDenseMap) console.log(`[DENSE_MAP_NULL] Could not find '${anchor.text}' in Civet line, null mapping at ${i}:${anchor.start.character}`);
+        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Could not find '${anchor.text}' in Civet line, null mapping at ${i}:${anchor.start.character}`);
         lineSegments.push([0]);
       }
 
@@ -222,17 +222,17 @@ function generateDecodedMappings(
         endColumn += 1;
       }
       lastGenCol = endColumn;
-      if (debugDenseMap) console.log(`[RANGE_DEBUG] USER-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}, finalEndCol=${endColumn}. Updated lastGenCol to ${lastGenCol}.`);
+      if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] USER-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}, finalEndCol=${endColumn}. Updated lastGenCol to ${lastGenCol}.`);
     }
 
     // --- Fill final gap from last token to end of line ---
     if (lastGenCol < tsLines[i].length) {
-      if (debugDenseMap) console.log(`[DENSE_MAP_NULL] EOL Gap filler at ${i}:${lastGenCol}`);
+      if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] EOL Gap filler at ${i}:${lastGenCol}`);
       lineSegments.push([0]);
     }
 
     if (lineSegments.length > 0) {
-      if (debugDenseMap) console.log(`[DENSE_LINE_DONE] Final segments for TS line ${i}: ${JSON.stringify(lineSegments)}`);
+      if (DEBUG_DENSE_MAP) console.log(`[DENSE_LINE_DONE] Final segments for TS line ${i}: ${JSON.stringify(lineSegments)}`);
       decoded.push(lineSegments);
     } else {
       // For completely empty lines, push an empty segment array
@@ -270,7 +270,7 @@ export function normalizeCivetMap(
 ): EncodedSourceMap {
   // Map TS operator tokens to their Civet equivalents. Defined up-front so the
   // AST walker and later search logic can reference it safely.
-  const OPERATOR_MAP: Record<string, string> = {
+  const operatorLookup: Record<string, string> = {
     '===': ' is ',
     '!==': ' isnt ',
     '&&':  ' and ',
@@ -283,7 +283,7 @@ export function normalizeCivetMap(
   let tsAnchors: Anchor[] = [];
   if (tsCode) {
     try {
-      tsAnchors = collectTsAnchors(tsCode, svelteFilePath, OPERATOR_MAP);
+      tsAnchors = collectAnchorsFromTs(tsCode, svelteFilePath, operatorLookup);
     } catch (e) {
       console.error(`[MAP_TO_V3 ${svelteFilePath}] Error parsing compiled TS for AST: ${(e as Error).message}`);
     }
@@ -298,10 +298,10 @@ export function normalizeCivetMap(
   // original source or to null. Gaps between tokens are also filled with null
   // mappings. This prevents "fall-through" errors in chained sourcemap consumers.
   // ---------------------------------------------------------------------------
-  const debugDenseMap = false; // Toggle for verbose dense-map generation logs (disabled for production)
-  const debugTokenMapping = false; // Token-level mapping debug flag disabled
+  const DEBUG_DENSE_MAP = false; // Toggle for verbose dense-map generation logs (disabled for production)
+  const DEBUG_TOKEN = false; // Token-level mapping debug flag disabled
 
-  if (debugDenseMap) {
+  if (DEBUG_DENSE_MAP) {
     console.log(`\n--- [DEBUG] ORIGINAL CIVET COMPILER MAP (DECODED) ---`);
     if (civetMap.lines) {
         civetMap.lines.forEach((lineSegments, index) => {
@@ -335,23 +335,23 @@ export function normalizeCivetMap(
     generatedIdentifiers,
     anchorsByLine,
     names
-  } = prepareMappingData(tsAnchors, civetMap, civetCodeLines);
+  } = buildLookupTables(tsAnchors, civetMap, civetCodeLines);
 
-  const decoded = generateDecodedMappings(
+  const decoded = buildDenseMapLines(
     tsLines,
     anchorsByLine,
     generatedIdentifiers,
     tsLineToCivetLineMap,
     civetCodeLines,
-    OPERATOR_MAP,
+    operatorLookup,
     civetBlockStartLine,
     indentation,
     names,
-    debugDenseMap,
-    debugTokenMapping
+    DEBUG_DENSE_MAP,
+    DEBUG_TOKEN
   );
 
-  if (debugDenseMap) {
+  if (DEBUG_DENSE_MAP) {
     console.log(`\n--- [DEBUG] FINAL NORMALIZED SVELTE->TS MAP (DECODED) ---`);
     decoded.forEach((lineSegments, index) => {
         const segmentsStr = lineSegments.map(seg => `[${seg.join(',')}]`).join('');
@@ -374,7 +374,7 @@ export function normalizeCivetMap(
     return out;
   });
 
-  if (debugDenseMap) {
+  if (DEBUG_DENSE_MAP) {
     console.log(`\n--- [DEBUG] CLEANED NORMALIZED MAP (WITH NULL TERMINATORS) ---`);
     cleanedDecoded.forEach((lineSegments, index) => {
         const segmentsStr = lineSegments.map(seg => `[${seg.join(',')}]`).join('');
