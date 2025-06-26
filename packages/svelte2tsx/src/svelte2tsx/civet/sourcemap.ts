@@ -117,6 +117,7 @@ export function normalizeCivetMap(
   // mappings. This prevents "fall-through" errors in chained sourcemap consumers.
   // ---------------------------------------------------------------------------
   const debugDenseMap = true; // Toggle for verbose dense-map generation logs
+  const debugTokenMapping = true; // New debug flag for token mapping
 
   if (debugDenseMap) {
     console.log(`\n--- [DEBUG] ORIGINAL CIVET COMPILER MAP (DECODED) ---`);
@@ -248,6 +249,24 @@ export function normalizeCivetMap(
           }
           foundIndex = match.index;
         }
+      } else if (anchor.kind === 'operator') {
+        // For operators, we need to be more precise about the mapping
+        if (debugDenseMap) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
+        const operatorRegex = new RegExp(`\\s*${searchText.trim()}\\s*`, 'g');
+        let searchOffset = 0;
+        for (let j = 0; j <= consumedCount; j++) {
+          operatorRegex.lastIndex = searchOffset;  // Use searchOffset in the regex
+          const match = operatorRegex.exec(civetLineText);
+          if (!match) {
+            foundIndex = -1;
+            break;
+          }
+          // Find the actual operator position within the match
+          const fullMatch = match[0];
+          const leadingSpace = fullMatch.match(/^\s*/)[0].length;
+          foundIndex = match.index + leadingSpace;
+          searchOffset = match.index + fullMatch.length;
+        }
       } else {
         if (debugDenseMap) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
         let searchOffset = 0;
@@ -273,7 +292,6 @@ export function normalizeCivetMap(
       if (civetColumn !== undefined) {
         const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
         const sourceSvelteStartCol = civetColumn + indentation;
-        const sourceSvelteEndCol = sourceSvelteStartCol + anchor.text.length;
         const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
         
         // Add mapping for token start
@@ -282,18 +300,24 @@ export function normalizeCivetMap(
         lineSegments.push(startSegment);
         
         // Add mapping for token end (exclusive)
-        const endColumn = anchor.start.character + anchor.text.length - 1;
-        const sourceSvelteEndColExclusive = sourceSvelteEndCol - 1;
-        const endSegment = [endColumn, 0, sourceSvelteLine, sourceSvelteEndColExclusive];
+        const tokenLength = anchor.text.length;
+        const endColumn = anchor.start.character + tokenLength;
+        const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength - 1; // -1 to point to last char
+        const endSegment = [endColumn - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive];
         if (nameIdx > -1) endSegment.push(nameIdx);
         lineSegments.push(endSegment);
         
-        // Add NULL mapping immediately after the token
-        lineSegments.push([endColumn + 1]);
-        
-        if (debugDenseMap) {
-          console.log(`[DENSE_MAP_SEG] Mapped '${anchor.text}' at ${i}:${anchor.start.character}-${endColumn} to Svelte L${sourceSvelteLine}:${sourceSvelteStartCol}-${sourceSvelteEndColExclusive}. Null at ${endColumn + 1}`);
-          console.log(`[SOURCE_LINE_FIX] Mapped '${anchor.text}' civetLineIdx=${civetLineIndex} -> svelteLine=${sourceSvelteLine}`);
+        // Add NULL mapping for whitespace after token
+        lineSegments.push([0, 0, sourceSvelteLine, sourceSvelteEndColExclusive + 1]);
+
+        if (debugTokenMapping && anchor.text === 'abc') {
+            console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
+            console.log(`- Token length: ${tokenLength}`);
+            console.log(`- TS Start: Column ${anchor.start.character}`);
+            console.log(`- TS End (exclusive): Column ${endColumn}`);
+            console.log(`- Svelte Start: Column ${sourceSvelteStartCol}`);
+            console.log(`- Svelte End (exclusive): Column ${sourceSvelteEndColExclusive}`);
+            console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment])}\n`);
         }
       } else {
         // Could not find in original line, treat as generated.
@@ -336,11 +360,16 @@ export function normalizeCivetMap(
 
   // Post-process: remove all single-number segments (null mappings)
   const cleanedDecoded = decoded.map(line => 
-    line.filter(segment => segment.length >= 4)
+    // Keep null mappings that terminate token ranges
+    line.filter(segment => 
+      segment.length >= 4 || 
+      // Keep null mappings that come immediately after a token mapping
+      (segment.length === 1 && line.indexOf(segment) > 0 && line[line.indexOf(segment) - 1].length >= 4)
+    )
   );
 
   if (debugDenseMap) {
-    console.log(`\n--- [DEBUG] CLEANED NORMALIZED MAP (NO NULL MAPPINGS) ---`);
+    console.log(`\n--- [DEBUG] CLEANED NORMALIZED MAP (WITH NULL TERMINATORS) ---`);
     cleanedDecoded.forEach((lineSegments, index) => {
         const segmentsStr = lineSegments.map(seg => `[${seg.join(',')}]`).join('');
         console.log(`Svelte -> TS Line ${index}: ${segmentsStr}`);
