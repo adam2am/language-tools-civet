@@ -376,7 +376,7 @@ export function normalizeCivetMap(
             anchor,
             civetLineText,
             0,
-            operatorLookup,
+    operatorLookup,
             false
           );
           if (civetColumn !== undefined) {
