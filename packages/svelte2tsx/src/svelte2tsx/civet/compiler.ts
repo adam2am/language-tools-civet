@@ -9,7 +9,6 @@ function getModule(): typeof import('@danielx/civet') | null {
   if (moduleCache !== undefined) return moduleCache;
   try {
     // Use require to allow optional dependency
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
     moduleCache = require('@danielx/civet');
   } catch (e) {
     console.warn('[compileCivet] @danielx/civet not found, skipping Civet compilation');

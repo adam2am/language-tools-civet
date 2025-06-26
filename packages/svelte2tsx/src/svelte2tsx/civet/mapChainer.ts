@@ -149,8 +149,8 @@ export function chainMaps(
       const tracerLine = (preprocessedLine + 1) - block.tsSnippet.startLine;
       // The tracer (normalized Civet map) expects columns relative to the dedented TS snippet.
       // We need to subtract the amount of indent that was artificially re-added when the TS
-      // code was inserted back into the <script> block.  Most of the time this is the
-      // uniform `removedCivetContentIndentLength`, but if a per-line table is provided we
+      // code was inserted back into the <script> block. Most of the time this is the
+      // uniform `block.sourceIndent.commonLength`, but if a per-line table is provided we
       // use that for higher accuracy / uneven indents.
       const indentRemovedForThisLine =
         (block.sourceIndent.perLineLengths &&
@@ -162,12 +162,25 @@ export function chainMaps(
 
       let traced: readonly number[] | null = null;
       try {
+        if (chainCivetDebug) console.log(`[CHAINER_INPUT] Querying Civet->TS map for L${tracerLine}C${tracerCol}`);
         traced = traceSegment(tracer, tracerLine, Math.max(0, tracerCol));
+        if (chainCivetDebug) console.log(`[CHAINER_OUTPUT] traceSegment raw result: ${JSON.stringify(traced)}`);
       } catch (e) {
         if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Error during traceSegment: ${(e as Error).message}`);
       }
 
-      if (!(traced && traced.length >= 4)) {
+      // ------------------------------------------------------------------
+      // Handle tracing result cases:
+      // 1) traced && len>=4  -> full mapping segment (success)
+      // 2) traced && len===1 -> explicit null mapping -> propagate [generatedCol]
+      // 3) traced null or <4 -> attempt limited backtrack, else propagate null
+      // ------------------------------------------------------------------
+
+      if (traced && traced.length === 1) {
+        // Case 2: explicit null mapping from dense Civet map
+        codeLines.push([generatedCol]);
+        if (chainCivetDebug) console.log(`[CHAINER_NULL_PRESERVE] Explicit null mapping preserved at generatedCol ${generatedCol}`);
+      } else if (!(traced && traced.length >= 4)) {
         /* ---------------------------------------------------------
          * Backtrack leftward on the same line until we
          * find a column that traces, then shift the original column
@@ -188,14 +201,14 @@ export function chainMaps(
         }
 
         if (tracedPrev && tracedPrev.length >= 4) {
+          if (chainCivetDebug) console.log(`[CHAINER_BACKTRACK_SUCCESS] L${tracerLine}C${tracerCol} succeeded by backtracking to C${backtrackCol}.`);
           const deltaCol = tracerCol - backtrackCol;
           const adjustedOrigCol = tracedPrev[3] + deltaCol;
           codeLines.push([generatedCol, 0, tracedPrev[2], adjustedOrigCol, nameIndex].filter(n => n !== undefined));
-          if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED at exact col. Used backtrack to col ${backtrackCol}. New segment: [${generatedCol}, 0, ${tracedPrev[2]}, ${adjustedOrigCol}${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
         } else {
-          // Still no luck – fall back to script start
-          codeLines.push([generatedCol, 0, block.svelte.civetStartIndex, 0, nameIndex].filter(n => n !== undefined));
-          if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Trace FAILED after backtrack. Fallback to Svelte L${block.svelte.civetStartIndex + 1}C0. Final segment: [${generatedCol}, 0, ${block.svelte.civetStartIndex}, 0${nameIndex !== undefined ? ', '+nameIndex : ''}]`);
+          // Still no luck – propagate null mapping instead of incorrect fallback
+          codeLines.push([generatedCol]);
+          if (chainCivetDebug) console.log(`[CHAINER_NULL_FALLBACK] Trace & backtrack failed. Propagated null mapping at generatedCol ${generatedCol}.`);
         }
       } else {
         // Normal successful trace path
