@@ -412,13 +412,25 @@ export function normalizeCivetMap(
         })}`);
       }
 
-      // 2) Null-mapping at the first column *after* the token, but only if there's
-      //    actual whitespace before the next token.
+      // 2) Mapping at the first column *after* the token. This helps IDEs
+      //    determine the end of the token's range for features like hover.
       const nextAnchorStart = j + 1 < lineAnchors.length ? lineAnchors[j + 1].start.character : undefined;
       if (nextAnchorStart === undefined || anchor.end.character < nextAnchorStart) {
-        addMapping(gen, {
+        const mapping: any = { // Using `any` for broader compatibility
           generated: { line: tsLineIdx + 1, column: anchor.end.character },
-        });
+        };
+        // If the original token was mapped, map the space after it to the space
+        // after the original token. Otherwise, it's a null mapping.
+        if (origLine !== undefined && origCol !== undefined) {
+            mapping.source = svelteFilePath;
+            mapping.original = { line: origLine + 1, column: origCol + anchor.text.length };
+        }
+        addMapping(gen, mapping);
+
+        if (DEBUG_DENSE_MAP) {
+          const status = origLine !== undefined ? `Mapped to ${mapping.original!.line}:${mapping.original!.column}` : 'Null-mapped';
+          console.log(`- Whitespace after '${anchor.text}': ${status}`);
+        }
       }
 
       if (DEBUG_DENSE_MAP) {
