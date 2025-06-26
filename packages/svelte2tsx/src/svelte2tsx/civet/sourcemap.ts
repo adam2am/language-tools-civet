@@ -298,8 +298,8 @@ export function normalizeCivetMap(
   // original source or to null. Gaps between tokens are also filled with null
   // mappings. This prevents "fall-through" errors in chained sourcemap consumers.
   // ---------------------------------------------------------------------------
-  const debugDenseMap = true; // Toggle for verbose dense-map generation logs
-  const debugTokenMapping = true; // New debug flag for token mapping
+  const debugDenseMap = false; // Toggle for verbose dense-map generation logs (disabled for production)
+  const debugTokenMapping = false; // Token-level mapping debug flag disabled
 
   if (debugDenseMap) {
     console.log(`\n--- [DEBUG] ORIGINAL CIVET COMPILER MAP (DECODED) ---`);
@@ -360,15 +360,19 @@ export function normalizeCivetMap(
     console.log(`--- END FINAL NORMALIZED MAP ---\n`);
   }
 
-  // Post-process: remove all single-number segments (null mappings)
-  const cleanedDecoded = decoded.map(line => 
-    // Keep null mappings that terminate token ranges
-    line.filter(segment => 
-      segment.length >= 4 || 
-      // Keep null mappings that come immediately after a token mapping
-      (segment.length === 1 && line.indexOf(segment) > 0 && line[line.indexOf(segment) - 1].length >= 4)
-    )
-  );
+  // Post-process: strip redundant nulls in a single pass (O(n))
+  const cleanedDecoded = decoded.map(line => {
+    const out: number[][] = [];
+    let prevHadMapping = false;
+    for (const seg of line) {
+      const isMapping = seg.length >= 4;
+      if (isMapping || (seg.length === 1 && prevHadMapping)) {
+        out.push(seg);
+      }
+      prevHadMapping = isMapping;
+    }
+    return out;
+  });
 
   if (debugDenseMap) {
     console.log(`\n--- [DEBUG] CLEANED NORMALIZED MAP (WITH NULL TERMINATORS) ---`);
