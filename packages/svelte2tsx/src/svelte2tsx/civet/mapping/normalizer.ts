@@ -140,10 +140,12 @@ function buildDenseMapLines(
     let lastGenCol = 0;
 
     for (const anchor of lineAnchors) {
-      // --- Fill gap before this token with a null mapping ---
-      if (anchor.start.character > lastGenCol) {
-        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol}`);
-        lineSegments.push([0]);
+      if (DEBUG_DENSE_MAP) {
+        const nameIdxForLog = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
+        console.log(`\n[ANCHOR_PROCESS] Line ${i}, Col ${anchor.start.character}: Processing anchor text='${anchor.text}', kind='${anchor.kind}'. Name index: ${nameIdxForLog}`);
+        if (anchor.kind === 'identifier' && nameIdxForLog === -1) {
+          console.log(`[ANCHOR_WARN] Identifier '${anchor.text}' was not found in the 'names' array. It will not be mapped with a name.`)
+        }
       }
 
       // --- Determine mapping for the current token ---
@@ -154,7 +156,7 @@ function buildDenseMapLines(
 
       if (isGenerated) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Generated token '${anchor.text}' at ${i}:${anchor.start.character}`);
-        lineSegments.push([0]);
+        lineSegments.push([anchor.start.character]);
         lastGenCol = anchor.end.character;
         if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] GEN-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
         continue;
@@ -164,7 +166,7 @@ function buildDenseMapLines(
       const civetLineIndex = tsLineToCivetLineMap.get(i);
       if (civetLineIndex === undefined) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] No civet line for TS line ${i}, null mapping token '${anchor.text}'`);
-        lineSegments.push([0]);
+        lineSegments.push([anchor.start.character]);
         lastGenCol = anchor.end.character;
         continue;
       }
@@ -185,50 +187,31 @@ function buildDenseMapLines(
         const sourceSvelteStartCol = civetColumn + indentation;
         const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
         
-        // Add mapping for token start
         const startSegment = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
-        if (nameIdx > -1) startSegment.push(nameIdx);
+        if (nameIdx > -1) {
+            startSegment.push(nameIdx);
+        }
         lineSegments.push(startSegment);
         
-        // Add mapping for token end (exclusive)
-        const tokenLength = anchor.text.length;
-        const endColumn = anchor.start.character + tokenLength;
-        const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength - 1; // -1 to point to last char
-        const endSegment = [endColumn - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive];
-        if (nameIdx > -1) endSegment.push(nameIdx);
-        lineSegments.push(endSegment);
-        
-        // Add NULL mapping for whitespace after token
-        lineSegments.push([0, 0, sourceSvelteLine, sourceSvelteEndColExclusive + 1]);
+        // Add a null mapping for the whitespace after the token
+        lineSegments.push([anchor.end.character]);
 
         if (DEBUG_TOKEN && anchor.text === 'abc') {
             console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
-            console.log(`- Token length: ${tokenLength}`);
+            console.log(`- Token length: ${anchor.text.length}`);
             console.log(`- TS Start: Column ${anchor.start.character}`);
-            console.log(`- TS End (exclusive): Column ${endColumn}`);
             console.log(`- Svelte Start: Column ${sourceSvelteStartCol}`);
-            console.log(`- Svelte End (exclusive): Column ${sourceSvelteEndColExclusive}`);
-            console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment])}\n`);
+            console.log(`- Null whitespace mapping: [${anchor.end.character}]`);
+            console.log(`- Generated segments: ${JSON.stringify([startSegment, [anchor.end.character]])}\n`);
         }
       } else {
         // Could not find in original line, treat as generated.
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Could not find '${anchor.text}' in Civet line, null mapping at ${i}:${anchor.start.character}`);
-        lineSegments.push([0]);
+        lineSegments.push([anchor.start.character]);
       }
 
-      let endColumn = anchor.end.character;
-      // Per your request, extend the mapping range by one character to ensure the full token is covered.
-      if (endColumn < tsLines[i].length) {
-        endColumn += 1;
-      }
-      lastGenCol = endColumn;
-      if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] USER-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}, finalEndCol=${endColumn}. Updated lastGenCol to ${lastGenCol}.`);
-    }
-
-    // --- Fill final gap from last token to end of line ---
-    if (lastGenCol < tsLines[i].length) {
-      if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] EOL Gap filler at ${i}:${lastGenCol}`);
-      lineSegments.push([0]);
+      lastGenCol = anchor.end.character;
+      if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] USER-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}, finalEndCol=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
     }
 
     if (lineSegments.length > 0) {
@@ -298,8 +281,8 @@ export function normalizeCivetMap(
   // original source or to null. Gaps between tokens are also filled with null
   // mappings. This prevents "fall-through" errors in chained sourcemap consumers.
   // ---------------------------------------------------------------------------
-  const DEBUG_DENSE_MAP = false; // Toggle for verbose dense-map generation logs (disabled for production)
-  const DEBUG_TOKEN = false; // Token-level mapping debug flag disabled
+  const DEBUG_DENSE_MAP = true; // Toggle for verbose dense-map generation logs (disabled for production)
+  const DEBUG_TOKEN = true; // Token-level mapping debug flag disabled
 
   if (DEBUG_DENSE_MAP) {
     console.log(`\n--- [DEBUG] ORIGINAL CIVET COMPILER MAP (DECODED) ---`);

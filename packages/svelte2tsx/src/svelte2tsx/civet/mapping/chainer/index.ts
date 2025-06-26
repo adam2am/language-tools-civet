@@ -78,6 +78,24 @@ export function chainCivetMaps(
     });
   });
 
+  // Combine names from all blocks into the base map and create a re-indexing map.
+  const finalNames = [...baseMap.names];
+  const nameMap = new Map<string, number>(finalNames.map((name, i) => [name, i]));
+  const blockNameMaps: (Map<number, number> | undefined)[] = blocks.map(block => {
+      if (!block.map.names?.length) return undefined;
+      const blockMap = new Map<number, number>();
+      for (let i = 0; i < block.map.names.length; i++) {
+          const name = block.map.names[i];
+          if (!nameMap.has(name)) {
+              nameMap.set(name, finalNames.length);
+              finalNames.push(name);
+          }
+          blockMap.set(i, nameMap.get(name)!);
+      }
+      return blockMap;
+  });
+  if (chainCivetDebug) console.log(`[CHAIN_MAPS] Merged all names. Final count: ${finalNames.length}`);
+
   const lineDeltas: number[] = [0]; 
   let currentCumulativeDelta = 0;
   for (let i = 0; i < blocks.length; i++) {
@@ -120,7 +138,7 @@ export function chainCivetMaps(
       }
     }
     // Remap script segments via trace-mapping
-    const codeLines = mapScriptSegments(codeSegs, blocks, tracers, chainCivetDebug);
+    const codeLines = mapScriptSegments(codeSegs, blocks, tracers, blockNameMaps, chainCivetDebug);
     
     // Remap template segments by adjusting line delta
     const tmplLines = mapTemplateSegments(tmplSegs, blocks, lineDeltas);
@@ -151,7 +169,7 @@ export function chainCivetMaps(
     version: 3,
     sources: [baseMap.sources[0]], 
     sourcesContent: [originalSvelteContent],
-    names: baseMap.names,
+    names: finalNames,
     mappings: finalEncodedMappings,
     file: baseMap.file 
   };
