@@ -113,12 +113,24 @@ function buildLookupTables(
     lineAnchors.sort((a, b) => a.start.character - b.start.character);
   }
 
-  const names = Array.from(new Set(tsAnchors.filter(a => a.kind === 'identifier').map(a => a.text)));
+  // Create sorted list of all non-generated identifiers for consistent name indexing
+  const names = Array.from(new Set(tsAnchors
+    .filter(a => a.kind === 'identifier' && !generatedIdentifiers.has(a.text))
+    .map(a => a.text)
+    .sort()
+  ));
   
   return { tsLineToCivetLineMap, generatedIdentifiers, anchorsByLine, names };
 }
 
 const DEBUG_DENSE_MAP = true; // Toggle for verbose dense-map generation logs (disabled for production)
+const DEBUG_NO_NAMES = true; // Experimental: When true, generates only 4-delta segments without name indices
+
+function getNameIndex(anchor: Anchor, names: string[], generatedIdentifiers: Set<string>): number {
+  return anchor.kind === 'identifier' && !generatedIdentifiers.has(anchor.text)
+    ? names.indexOf(anchor.text)
+    : -1;
+}
 
 export function buildDenseMapLines(
   tsLines: string[],
@@ -186,7 +198,7 @@ export function buildDenseMapLines(
       if (civetColumn !== undefined) {
         const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
         const sourceSvelteStartCol = civetColumn + indentation;
-        const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
+        const nameIdx = getNameIndex(anchor, names, generatedIdentifiers);
         
         const startSegment = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
         if (nameIdx > -1) {
@@ -323,6 +335,13 @@ export function normalizeCivetMap(
     names
   } = buildLookupTables(tsAnchors, civetMap, civetCodeLines);
 
+  // ----- Optional debug: show how identifiers are assigned name indices -----
+  if (DEBUG_DENSE_MAP) {
+    console.log("\n=== NAME INDEX TABLE ===");
+    names.forEach((n, i) => console.log(`${i}: ${n}`));
+    console.log("=== END NAME INDEX TABLE ===\n");
+  }
+
   // Iterate over each TS line and its anchors to build mappings
   for (let tsLineIdx = 0; tsLineIdx < tsLines.length; tsLineIdx++) {
     const lineAnchors = anchorsByLine.get(tsLineIdx) || [];
@@ -338,6 +357,9 @@ export function normalizeCivetMap(
 
       // Determine if the identifier is compiler generated
       const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
+
+      // Compute name index for non-generated identifiers (needed for debug logging)
+      const nameIdx = anchor.kind === 'identifier' && !isGenerated ? names.indexOf(anchor.text) : -1;
 
       if (DEBUG_DENSE_MAP && isGenerated) {
         console.log(`- Status: Generated token`);
@@ -397,6 +419,17 @@ export function normalizeCivetMap(
         addMapping(gen, {
           generated: { line: tsLineIdx + 1, column: anchor.end.character },
         });
+      }
+
+      if (DEBUG_DENSE_MAP) {
+        console.log(`\nProcessing token: '${anchor.text}' (${anchor.kind})`);
+        if (anchor.kind === 'identifier') {
+          console.log(`- Generated: ${generatedIdentifiers.has(anchor.text)}`);
+          console.log(`- Name index lookup: '${anchor.text}' -> ${nameIdx}`);
+          if (nameIdx === -1 && !generatedIdentifiers.has(anchor.text)) {
+            console.log(`  WARNING: Non-generated identifier not found in names array!`);
+          }
+        }
       }
     }
   }
@@ -458,30 +491,58 @@ export function normalizeCivetMap(
         
         if (isGenerated) {
           segments.push([anchor.start.character]);
+          segments.push([anchor.end.character]);
         } else if (civetLineIndex !== undefined) {
           const origCol = locateTokenInCivetLine(anchor, civetCodeLines[civetLineIndex] || '', 0, operatorLookup, false);
           if (origCol !== undefined) {
             const origLine = (civetBlockStartLine - 1) + civetLineIndex;
-            const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
-            const segment = [
+            const startSegment = [
               anchor.start.character,
               0,
               origLine,
               origCol + indentation
             ];
-            if (nameIdx !== -1) {
-              segment.push(nameIdx);
+
+            // Add name index for non-generated identifiers
+            if (!DEBUG_NO_NAMES && anchor.kind === 'identifier' && !generatedIdentifiers.has(anchor.text)) {
+              const nameIdx = names.indexOf(anchor.text);
+              if (nameIdx !== -1) {
+                startSegment.push(nameIdx);
+              }
             }
-            segments.push(segment);
+            segments.push(startSegment);
+
+            // End segment (position only, no name index)
+            const endCol = origCol + indentation + (anchor.text.length - 1);
+            segments.push([
+              anchor.end.character - 1,
+              0,
+              origLine,
+              endCol
+            ]);
+
+            // Add whitespace mapping after token - same line, next column
+            segments.push([
+              0,
+              0,
+              origLine,
+              endCol + 1
+            ]);
           } else {
             segments.push([anchor.start.character]);
+            segments.push([anchor.end.character]);
+            // For unmapped tokens in a known line, use that line number
+            if (civetLineIndex !== undefined) {
+              segments.push([0, 0, (civetBlockStartLine - 1) + civetLineIndex, 0]);
+            } else {
+              segments.push([0, 0, 0, 1]);
+            }
           }
         } else {
           segments.push([anchor.start.character]);
+          segments.push([anchor.end.character]);
+          segments.push([0, 0, 0, 1]);
         }
-        
-        // Add terminator segment
-        segments.push([anchor.end.character]);
       });
       
       return segments;
@@ -489,7 +550,7 @@ export function normalizeCivetMap(
 
     rawSegments.forEach((line, idx) => {
       if (line.length > 0) {
-        console.log(`Line ${idx + 1}: ${line.map(seg => JSON.stringify(seg)).join(' ')}`);
+        console.log(`Line ${idx + 1}: ${line.map(seg => JSON.stringify(seg)).join('')}`);
       }
     });
   }
