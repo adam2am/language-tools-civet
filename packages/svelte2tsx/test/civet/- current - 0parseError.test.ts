@@ -63,27 +63,93 @@ describe('Complex sourcemap validation for generated code #current', () => {
         console.log('\n=== STAGE 2 CORRELATION: Raw TS lines with their mappings ===');
         const rawTsLines = rawTsCode.split('\n');
         const civetLinesArr = civetContent.split('\n');
+
+        // First, build a reverse mapping from Civet line to TS line
+        const civetToTsLines = new Map<number, number[]>();
+        rawTsLines.forEach((line, tsLineIdx) => {
+            if (tsLineIdx < decodedMappings.length) {
+                for (const seg of decodedMappings[tsLineIdx]) {
+                    if (seg.length >= 4) {
+                        const civetLineIdx = seg[2];
+                        let tsLines = civetToTsLines.get(civetLineIdx) || [];
+                        if (!tsLines.includes(tsLineIdx)) {
+                            tsLines.push(tsLineIdx);
+                            civetToTsLines.set(civetLineIdx, tsLines);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Now show both TS->Svelte and Civet->TS mappings
         rawTsLines.forEach((line, i) => {
-            console.log(`${String(i + 1).padStart(3, ' ')}| ${line}`);
+            // Print TS line and its mappings
+            console.log(`\n--- TypeScript Line ${i + 1} ---`);
+            console.log(`TS   | ${line}`);
+            
             if (i < decodedMappings.length) {
-                const segs = decodedMappings[i];
-                if (segs.length === 0) {
-                    console.log('    (no mappings)');
-                } else {
-                    segs.forEach((seg: number[]) => {
-                        const genCol = seg[0];
+                // Convert segments to a map for quick lookup
+                const segmentMap = new Map<number, number[]>();
+                decodedMappings[i].forEach(seg => {
+                    segmentMap.set(seg[0], seg);
+                });
+
+                // Find corresponding Civet line if any mapping exists
+                let civetLineIdx: number | undefined;
+                for (const seg of decodedMappings[i]) {
+                    if (seg.length >= 4) {
+                        civetLineIdx = seg[2];
+                        break;
+                    }
+                }
+                
+                // Print Civet line if found
+                if (civetLineIdx !== undefined) {
+                    console.log(`Civet| ${civetLinesArr[civetLineIdx]}`);
+                }
+
+                // Show TS->Svelte mappings
+                console.log("TS -> Svelte mappings:");
+                for (let col = 0; col < line.length; col++) {
+                    const seg = segmentMap.get(col);
+                    if (seg) {
                         if (seg.length >= 4) {
                             const [, srcIdx, srcLine0, srcCol0] = seg;
                             const srcLine = srcLine0 + 1;
                             const srcCol = srcCol0;
                             const srcChar = civetLinesArr[srcLine0]?.[srcCol0] || '';
                             const name = seg.length === 5 ? preIntegrationMap.names[seg[4]] : '';
-                            console.log(`      [col ${genCol}] -> Svelte L${srcLine}:C${srcCol} '${srcChar}' ${name ? `(name: ${name})` : ''}`);
+                            console.log(`      TS[col ${String(col).padStart(2)}] -> Svelte L${srcLine}:C${srcCol} '${srcChar}' ${name ? `(name: ${name})` : ''}`);
                         } else {
-                            console.log(`      [col ${genCol}] -> (null mapping)`);
+                            console.log(`      TS[col ${String(col).padStart(2)}] -> (null mapping)`);
                         }
-                    });
+                    } else {
+                        console.log(`      TS[col ${String(col).padStart(2)}] -> (inherited from previous)`);
+                    }
                 }
+
+                // Show Civet->TS mappings if we found a Civet line
+                if (civetLineIdx !== undefined) {
+                    console.log("\nCivet -> TS mappings:");
+                    const civetLine = civetLinesArr[civetLineIdx];
+                    for (let col = 0; col < civetLine.length; col++) {
+                        const char = civetLine[col];
+                        // Find any TS columns that map back to this Civet position
+                        const mappedTsCols: number[] = [];
+                        decodedMappings[i].forEach(seg => {
+                            if (seg.length >= 4 && seg[2] === civetLineIdx && seg[3] === col) {
+                                mappedTsCols.push(seg[0]);
+                            }
+                        });
+                        if (mappedTsCols.length > 0) {
+                            console.log(`      Civet[col ${String(col).padStart(2)}] '${char}' -> TS cols: ${mappedTsCols.join(', ')}`);
+                        } else {
+                            console.log(`      Civet[col ${String(col).padStart(2)}] '${char}' -> (no mapping)`);
+                        }
+                    }
+                }
+            } else {
+                console.log('    (no mappings)');
             }
         });
         console.log('=== END STAGE 2 CORRELATION ===\n');
@@ -342,63 +408,6 @@ describe('Complex sourcemap validation for generated code #current', () => {
         const scriptTagLineIndex = svelteLines.findIndex(l => l.includes('<script'));
         const scriptEndTagLineIndex = svelteLines.findIndex(l => l.includes('</script'));
         const civetSnippet = svelteLines.slice(scriptTagLineIndex + 1, scriptEndTagLineIndex).join('\n');
-
-        console.log('\n=== INTERMEDIATE ANALYSIS: FORWARD MAPPING FROM SVELTE SOURCE TO NORMALIZED CIVET-TS (pre-svelte2tsx integration) ===');
-        console.log('// This shows mapping from the Svelte file to the intermediate, normalized TS code before it gets merged by svelte2tsx.');
-        const scriptRegex = /<script lang="civet">([\s\S]*?)<\/script>/;
-        const match = svelte.match(scriptRegex);
-        if (match && match[1]) {
-            let civetContent = match[1];
-            // Remove leading and trailing newline, but preserve indentation
-            if (civetContent.startsWith('\n')) {
-                civetContent = civetContent.substring(1);
-            }
-            if (civetContent.endsWith('\n')) {
-                civetContent = civetContent.slice(0, -1);
-            }
-
-            const scriptLine = svelteLines[scriptTagLineIndex];
-            const indentLen = scriptLine.match(/^\s*/)?.[0].length ?? 0;
-
-            const { code: rawTsCode, rawMap } = compileCivet(civetContent, filename, {});
-            const preIntegrationMap = normalize(
-                rawMap,
-                rawTsCode,
-                { getText: () => civetContent, filename },
-                {},
-                scriptTagLineIndex + 1, // 1-based
-                indentLen
-            );
-
-            // Create a tracer for the pre-integration map
-            const preIntegrationTracer = new TraceMap({
-                version: 3,
-                file: preIntegrationMap.file || null,
-                sourceRoot: preIntegrationMap.sourceRoot || null,
-                sources: [...preIntegrationMap.sources],
-                sourcesContent: preIntegrationMap.sourcesContent ? [...preIntegrationMap.sourcesContent] : null,
-                names: [...(preIntegrationMap.names || [])],
-                mappings: decode(preIntegrationMap.mappings),
-                ignoreList: preIntegrationMap.ignoreList ? [...preIntegrationMap.ignoreList] : null
-            });
-
-            console.log(`Analyzing Svelte line ${svelteLineToAnalyzeIdx + 1}: "${svelteLineToAnalyze.trim()}"`);
-
-            for (let col = 0; col < svelteLineToAnalyze.length; col++) {
-                const char = svelteLineToAnalyze[col];
-                const genPos = generatedPositionFor(preIntegrationTracer, {
-                    source: filename,
-                    line: svelteLineToAnalyzeIdx + 1,
-                    column: col,
-                });
-                if (genPos.line !== null) {
-                    const tsxChar = rawTsCode.split('\n')[genPos.line - 1]?.[genPos.column] || '';
-                    console.log(`Svelte Col ${col.toString().padStart(2)}: '${char}' -> Normalized TS L${genPos.line}:C${genPos.column} ('${tsxChar}')`);
-                } else {
-                    console.log(`Svelte Col ${col.toString().padStart(2)}: '${char}' -> No mapping`);
-                }
-            }
-        }
 
         const { rawMap: rawCivetMap } = compileCivet(civetSnippet, filename, { outputStandardV3Map: true });
         

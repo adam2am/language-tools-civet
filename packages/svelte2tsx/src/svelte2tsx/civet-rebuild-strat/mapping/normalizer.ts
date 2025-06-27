@@ -12,8 +12,8 @@ export interface SvelteFile {
 
 export type CivetCompileOptions = Record<string, any>;
 
-//const DEBUG_DENSE_MAP = false;
-//const logFullDenseMap = (..._args: any[]) => {}; // No-op for now
+const DEBUG_DENSE_MAP = false;
+const logFullDenseMap = (..._args: any[]) => {}; // No-op for now
 
 // Mapping of TS operator/keyword representations to Civet equivalents
 const TS_TO_CIVET_ALIASES: Record<string, string[]> = {
@@ -135,7 +135,9 @@ export function normalize(
 
     for (const anchor of anchors) {
         // Skip whitespace-only anchors, they are handled by the null-mapping pass
-        if (anchor.text.trim() === '') continue;
+        if (anchor.text.trim() === '') {
+      continue;
+    }
 
         // Skip generated identifiers
         if (isGeneratedIdentifier(anchor.text, anchor.kind)) {
@@ -155,7 +157,7 @@ export function normalize(
                     break;
                 }
             }
-        } else if (Array.isArray(civetMap.lines)) {
+    } else if (Array.isArray(civetMap.lines)) {
             for (const seg of civetMap.lines[tsLine] || []) {
                 if (seg.length >= 4) {
                     civetLineIndex = seg[2];
@@ -189,46 +191,51 @@ export function normalize(
 
         // Calculate final source positions
         const origLine = civetLineIndex + civetContentStartLine - 1;
-        const origCol = indentLen + position.startIndex;
+        const origCol = indentLen + position.startIndex; // include outer <script> indent exactly once
 
-        // Ensure we have a Set for this line's used columns
+        // Track this position as used on the generated side
         let usedCols = usedGenPositions.get(tsLine);
         if (!usedCols) {
             usedCols = new Set<number>();
             usedGenPositions.set(tsLine, usedCols);
         }
 
-        const tsLen = anchor.text.length;
-        const cvLen = position.length;
+        const tsLen = anchor.text.length;      // length in generated code
+        const cvLen = position.length;         // matched length in Civet source
 
-        // Map the token's first column (start position)
-        if (!usedCols.has(tsCol)) {
-            usedCols.add(tsCol);
-            if (shouldLog) log(`Mapping token start "${anchor.text}" at TSX L${tsLine + 1}:C${tsCol} => Svelte L${origLine + 1}:C${origCol}`);
+        // We map ONLY the first generated column of the token. All following columns inherit this
+        // mapping until the next segment. This keeps the map small while remaining accurate.
+        const genColStart = tsCol;
+        if (!usedCols.has(genColStart)) {
+            usedCols.add(genColStart);
             addMapping(gen, {
-                generated: { line: tsLine + 1, column: tsCol },
+                generated: { line: tsLine + 1, column: genColStart },
                 source: civetSource,
                 original: { line: origLine + 1, column: origCol },
                 name: anchor.text
             });
         }
 
-        // Map the token's last column (end position)
-        const tsEndCol = tsCol + tsLen - 1;
-        const origEndCol = origCol + cvLen - 1;
-        if (!usedCols.has(tsEndCol)) {
-            usedCols.add(tsEndCol);
-            if (shouldLog) log(`Mapping token end "${anchor.text}" at TSX L${tsLine + 1}:C${tsEndCol} => Svelte L${origLine + 1}:C${origEndCol}`);
-            addMapping(gen, {
-                generated: { line: tsLine + 1, column: tsEndCol },
-                source: civetSource,
-                original: { line: origLine + 1, column: origEndCol }
-            });
+        // Mark the rest of the token columns as "already taken" so PASS-2 knows they are mapped,
+        // but DON'T emit individual mappings for them.
+        for (let i = 1; i < tsLen; i++) {
+            usedCols.add(tsCol + i);
         }
 
-        // Mark all columns of the token as used
-        for (let i = 0; i < tsLen; i++) {
-            usedCols.add(tsCol + i);
+        // Reserve the column _after_ the token as eligible for null-mapping so that whitespace does
+        // not inherit the token mapping. We do **not** map it here – PASS-2 will place a single
+        // null segment at the start of the whitespace run.
+
+        // Map whitespace AFTER token
+        const wsColAfterInCivet = indentLen + position.startIndex + cvLen; // char right after token
+        const wsAfterChar = civetLineText[position.startIndex + cvLen];
+        if (!usedCols.has(tsCol + tsLen) && wsAfterChar && /\s/.test(wsAfterChar)) {
+            usedCols.add(tsCol + tsLen);
+            addMapping(gen, {
+                generated: { line: tsLine + 1, column: tsCol + tsLen },
+                source: civetSource,
+                original: { line: origLine + 1, column: wsColAfterInCivet },
+            });
         }
     }
 
@@ -241,18 +248,19 @@ export function normalize(
 
         let inUnmappedRun = false;
         for (let col = 0; col < lineText.length; col++) {
-            if (!usedCols.has(col)) {
-                if (!inUnmappedRun) {
-                    // Start of unmapped run - emit ONE null segment
-                    if (shouldLog && lineIdx === tsLines.findIndex(l => l.includes('if (abc === query)'))) {
-                        log(`Null-mapping at TSX L${lineIdx + 1}:C${col} (char: "${lineText[col]}")`);
-                    }
-                    addMapping(gen, {
-                        generated: { line: lineIdx + 1, column: col }
-                    });
-                    inUnmappedRun = true;
+            const isMapped = usedCols.has(col);
+            if (!isMapped && !inUnmappedRun) {
+                // We just entered an unmapped run: emit ONE null segment
+                addMapping(gen, {
+                    generated: { line: lineIdx + 1, column: col }
+                });
+                inUnmappedRun = true;
+
+                if (shouldLog && lineIdx === tsLines.findIndex(l => l.includes('if (abc === query)'))) {
+                    log(`Null-mapped (run start) TSX L${lineIdx + 1}:C${col} (char: "${lineText[col]}")`);
                 }
-            } else {
+            } else if (isMapped && inUnmappedRun) {
+                // Exiting unmapped run
                 inUnmappedRun = false;
             }
         }
@@ -260,5 +268,10 @@ export function normalize(
 
     const map = toEncodedMap(gen);
     map.sourcesContent = [civetContent];
+
+    if (DEBUG_DENSE_MAP) {
+      logFullDenseMap(map, tsCode, civetContent);
+    }
+
     return map;
 }
