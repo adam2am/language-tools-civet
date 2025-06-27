@@ -78,6 +78,9 @@ function buildLookupTables(
   civetMap: LinesMap,
   civetCodeLines: string[]
 ) {
+  // Exclude comment lines when detecting generated identifiers
+  const codeLines = civetCodeLines.filter(line => !line.trim().startsWith('//'));
+  
   // Create a quick lookup to find the approximate Civet snippet line for a given TS line.
   const tsLineToCivetLineMap = new Map<number, number>();
   civetMap.lines.forEach((segments, tsLineIdx) => {
@@ -93,9 +96,17 @@ function buildLookupTables(
   const generatedIdentifiers = new Set<string>();
   for (const anchor of tsAnchors) {
     if (anchor.kind !== 'identifier') continue;
-    const escapedText = anchor.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    
+    // Always mark single-letter loop variables as generated
+    if (anchor.text.length === 1 && /^[ijkn]$/.test(anchor.text)) {
+      generatedIdentifiers.add(anchor.text);
+      continue;
+    }
+
+    const escapedText = anchor.text.replace(/[.*+?^${}()|[\\]\\]/g, '\\\\$&');
     const wordRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedText}(?![\\p{L}\\p{N}_$])`, 'u');
-    if (!civetCodeLines.some(line => wordRegex.test(line))) {
+    // Only consider code lines (ignore comments) when matching identifiers
+    if (!codeLines.some(line => wordRegex.test(line))) {
       generatedIdentifiers.add(anchor.text);
     }
   }
@@ -335,6 +346,8 @@ export function normalizeCivetMap(
     names
   } = buildLookupTables(tsAnchors, civetMap, civetCodeLines);
 
+  const consumedMatchCount = new Map<string, number>();
+
   // ----- Optional debug: show how identifiers are assigned name indices -----
   if (DEBUG_DENSE_MAP) {
     console.log("\n=== NAME INDEX TABLE ===");
@@ -372,14 +385,21 @@ export function normalizeCivetMap(
         const civetLineIndex = tsLineToCivetLineMap.get(tsLineIdx);
         if (civetLineIndex !== undefined) {
           const civetLineText = civetCodeLines[civetLineIndex] || '';
+
+          const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
+          const cacheKey = `${civetLineIndex}:${searchText}`;
+          const consumedCount = consumedMatchCount.get(cacheKey) || 0;
+
           const civetColumn = locateTokenInCivetLine(
             anchor,
             civetLineText,
-            0,
+            consumedCount,
     operatorLookup,
             false
           );
+
           if (civetColumn !== undefined) {
+            consumedMatchCount.set(cacheKey, consumedCount + 1);
             origLine = (civetBlockStartLine - 1) + civetLineIndex; // 0-based
             origCol = civetColumn + indentation;
 
@@ -395,6 +415,16 @@ export function normalizeCivetMap(
         }
       }
 
+      if (DEBUG_DENSE_MAP) {
+        console.log(`[TOKEN_BOUNDARY_DEBUG] Processing token '${anchor.text}':`);
+        console.log(`- Generated position: L${tsLineIdx + 1}:C${anchor.start.character}-${anchor.end.character}`);
+        if (origLine !== undefined) {
+          console.log(`- Original position: L${origLine + 1}:C${origCol}`);
+          console.log(`- Token length: ${anchor.text.length}`);
+          console.log(`- Next token starts at: ${j + 1 < lineAnchors.length ? lineAnchors[j + 1].start.character : 'EOL'}`);
+        }
+      }
+
       // 1) Mapping at the start of the token
       addMapping(gen, {
         generated: { line: tsLineIdx + 1, column: anchor.start.character },
@@ -405,31 +435,99 @@ export function normalizeCivetMap(
       });
 
       if (DEBUG_DENSE_MAP) {
-        console.log(`- Mapping: ${JSON.stringify({
+        console.log(`[MAPPING_DEBUG] Start mapping for '${anchor.text}':`);
+        console.log(JSON.stringify({
           gen: { line: tsLineIdx + 1, col: anchor.start.character },
           orig: origLine !== undefined ? { line: origLine + 1, col: origCol } : 'null',
           name: origLine !== undefined && anchor.kind === 'identifier' ? anchor.text : undefined
-        })}`);
+        }, null, 2));
       }
 
-      // 2) Mapping at the first column *after* the token. This helps IDEs
-      //    determine the end of the token's range for features like hover.
+      // 2) Add character-by-character mappings for multi-character tokens
+      if (origLine !== undefined && anchor.text.length > 1) {
+        for (let charIdx = 1; charIdx < anchor.text.length; charIdx++) {
+  if (DEBUG_DENSE_MAP) {
+            console.log(`[CHAR_MAPPING] Mapping character ${charIdx} of '${anchor.text}' at TSX col ${anchor.start.character + charIdx} to Svelte col ${origCol! + charIdx}`);
+          }
+          addMapping(gen, {
+            generated: { line: tsLineIdx + 1, column: anchor.start.character + charIdx },
+            source: svelteFilePath,
+            original: { line: origLine + 1, column: origCol! + charIdx }
+          });
+        }
+      }
+
+      // 3) Add explicit terminator mapping after the token
       const nextAnchorStart = j + 1 < lineAnchors.length ? lineAnchors[j + 1].start.character : undefined;
       if (nextAnchorStart === undefined || anchor.end.character < nextAnchorStart) {
-        const mapping: any = { // Using `any` for broader compatibility
-          generated: { line: tsLineIdx + 1, column: anchor.end.character },
-        };
-        // If the original token was mapped, map the space after it to the space
-        // after the original token. Otherwise, it's a null mapping.
-        if (origLine !== undefined && origCol !== undefined) {
-            mapping.source = svelteFilePath;
-            mapping.original = { line: origLine + 1, column: origCol + anchor.text.length };
-        }
-        addMapping(gen, mapping);
-
         if (DEBUG_DENSE_MAP) {
-          const status = origLine !== undefined ? `Mapped to ${mapping.original!.line}:${mapping.original!.column}` : 'Null-mapped';
-          console.log(`- Whitespace after '${anchor.text}': ${status}`);
+          console.log(`[TERMINATOR_DEBUG] Adding terminator after '${anchor.text}':`);
+          console.log(`- At column: ${anchor.end.character}`);
+          console.log(`- Next token starts at: ${nextAnchorStart || 'EOL'}`);
+  }
+
+        // First, map the end of the token to its original end position
+        if (origLine !== undefined) {
+          const lastCharCol = origCol! + anchor.text.length - 1;
+          addMapping(gen, {
+            generated: { line: tsLineIdx + 1, column: anchor.end.character - 1 },
+            source: svelteFilePath,
+            original: { line: origLine + 1, column: lastCharCol }
+          });
+
+          // Calculate how many columns until the next anchor OR end-of-line
+          const currentLineLength = tsLines[tsLineIdx].length;
+          const gap = nextAnchorStart !== undefined
+            ? Math.max(0, nextAnchorStart - anchor.end.character - 1)
+            : Math.max(0, currentLineLength - anchor.end.character - 1);
+
+          if (gap > 0) {
+            if (DEBUG_DENSE_MAP) {
+              console.log(`[GAP_DEBUG] Gap of ${gap} char(s) detected after token '${anchor.text}' on TS Line ${tsLineIdx + 1}.`);
+              console.log(`[GAP_DEBUG]   • First gap char (genCol ${anchor.end.character}) will map to Svelte L${origLine + 1}:C${origCol + anchor.text.length}` +
+                          ` (preserves real whitespace position).`);
+              if (gap > 1) {
+                console.log(`[GAP_DEBUG]   • Remaining ${gap - 1} char(s) will map to column 0 to terminate range.`);
+              }
+            }
+            // First gap char: map to actual position (C17 after abc)
+            addMapping(gen, {
+              generated: { line: tsLineIdx + 1, column: anchor.end.character },
+              source: svelteFilePath,
+              original: { line: origLine + 1, column: origCol + anchor.text.length }
+            });
+
+            // All subsequent gap chars: force to C0 to prevent bleed
+            if (gap > 1) {
+              if (DEBUG_DENSE_MAP) {
+                console.log(`[GAP_FILL] Mapping generated col ${anchor.end.character + 1}..${anchor.end.character + gap - 1}` +
+                            ` to Svelte column 0 (origLine ${origLine + 1}).`);
+              }
+              addMapping(gen, {
+                generated: { line: tsLineIdx + 1, column: anchor.end.character + 1 },
+                source: svelteFilePath,
+                original: { line: origLine + 1, column: 0 }  // Force to C0
+              });
+            }
+          } else {
+            // No gap or unknown gap (e.g., end-of-line). Emit single null terminator one char after token.
+            addMapping(gen, {
+              generated: { line: tsLineIdx + 1, column: anchor.end.character + 1 }
+            });
+          }
+
+          if (DEBUG_DENSE_MAP) {
+            console.log(`[RANGE_DEBUG] Token '${anchor.text}':`);
+            console.log(`- Start: TSX L${tsLineIdx + 1}:C${anchor.start.character} -> Svelte L${origLine + 1}:C${origCol}`);
+            console.log(`- End: TSX L${tsLineIdx + 1}:C${anchor.end.character - 1} -> Svelte L${origLine + 1}:C${lastCharCol}`);
+          }
+        } else {
+          // For generated tokens, just add a null mapping (but avoid colliding with the next anchor)
+          if (nextAnchorStart === undefined || anchor.end.character < nextAnchorStart) {
+            addMapping(gen, {
+              generated: { line: tsLineIdx + 1, column: anchor.end.character }
+            });
+          }
         }
       }
 
@@ -520,7 +618,7 @@ export function normalizeCivetMap(
               const nameIdx = names.indexOf(anchor.text);
               if (nameIdx !== -1) {
                 startSegment.push(nameIdx);
-              }
+  }
             }
             segments.push(startSegment);
 
