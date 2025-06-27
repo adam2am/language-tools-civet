@@ -190,28 +190,28 @@ export function normalize(
                     const ch = tsLines[tsLineIdx]?.[genCol] || '';
                     const isWs = /\s/.test(ch);
 
-                    // Track/guard only non-whitespace – whitespace will be handled later with null mapping
                     let usedCols = usedGenPositions.get(tsLineIdx);
                     if (!usedCols) {
                         usedCols = new Set<number>();
                         usedGenPositions.set(tsLineIdx, usedCols);
                     }
 
+                    // Stricter: only allow the first mapping to a genCol, null-map the rest
                     if (!isWs && usedCols.has(genCol)) {
-                        if (shouldLog && tsLineIdx === problemLineIdx) {
-                            log(`    [SEED] Duplicate genCol ${genCol} on TSX L${tsLineIdx+1} – skipping to avoid bleed`);
-                        }
-                        return; // avoid duplicate mapping at same generated position for non-ws
+                        // Instead of mapping, add a null mapping for this generated position
+                        addMapping(gen, {
+                            generated: { line: tsLineIdx + 1, column: genCol }
+                        });
+                        return;
                     }
-
                     if (!isWs) usedCols.add(genCol);
 
                     if (isWs) {
                         // Skip seeding whitespace – will add explicit null mapping later
                         if (shouldLog && tsLineIdx === problemLineIdx) {
                             log(`    [SEED] Skipping initial whitespace mapping for genCol ${genCol} on TSX L${tsLineIdx+1}`);
-        }
-      } else {
+                        }
+                    } else {
                         addMapping(gen, {
                             generated: { line: tsLineIdx + 1, column: genCol },
                             source: civetSource,
@@ -242,35 +242,26 @@ export function normalize(
                     const ch = tsLines[tsLineIdx]?.[genCol] || '';
                     const isWs = /\s/.test(ch);
 
-                    // Track/guard only non-whitespace – whitespace will be handled later with null mapping
                     let usedCols = usedGenPositions.get(tsLineIdx);
                     if (!usedCols) {
                         usedCols = new Set<number>();
                         usedGenPositions.set(tsLineIdx, usedCols);
                     }
 
-                    if (!isWs && usedCols.has(genCol)) {
+                    // --- FIRST-WINS LOGIC: Only map the first Civet source to each TSX position ---
+                    if (usedCols.has(genCol)) {
                         if (shouldLog && tsLineIdx === problemLineIdx) {
-                            log(`    [SEED-RAW] Duplicate genCol ${genCol} on TSX L${tsLineIdx+1} – skipping to avoid bleed`);
+                            log(`[PRUNE_DEBUG] SKIPPING mapping to already-used TSX L${tsLineIdx+1}:C${genCol}. Raw source was L${srcLine0+1}:C${srcCol0}.`);
                         }
-                        return; // avoid duplicate mapping at same generated position for non-ws
+                        return;
                     }
-
-                    if (!isWs) usedCols.add(genCol);
-
-                    if (isWs) {
-                        // Skip seeding whitespace – will add explicit null mapping later
-                        if (shouldLog && tsLineIdx === problemLineIdx) {
-                            log(`    [SEED-RAW] Skipping initial whitespace mapping for genCol ${genCol} on TSX L${tsLineIdx+1}`);
-                        }
-                    } else {
-                        addMapping(gen, {
-                            generated: { line: tsLineIdx + 1, column: genCol },
-                            source: civetSource,
-                            original: { line: srcLine0 + 1, column: srcCol0 },
-                            name: undefined // Explicitly clear name for raw map segments
-                        });
-                    }
+                    usedCols.add(genCol);
+                    addMapping(gen, {
+                        generated: { line: tsLineIdx + 1, column: genCol },
+                        source: civetSource,
+                        original: { line: srcLine0 + 1, column: srcCol0 },
+                        name: undefined
+                    });
                 }
             });
         });
@@ -309,8 +300,8 @@ export function normalize(
         const { line: genLine, character: genCol } = anchor.start;
 
         if (generatedIdentifiers.has(anchor.text)) {
-            // For generated identifiers like loop variable "i", ensure that both the identifier
-            // itself *and* the whitespace directly surrounding it do NOT map back to Civet.
+            // For generated identifiers like loop variable "i" or keywords like 'let', 'const', etc., ensure that both the identifier
+            // itself and the whitespace directly surrounding it do NOT map back to Civet.
             // We do this by explicitly adding mappings that point to { line: -1, column: -1 } which
             // SourceMap consumers interpret as "no mapping".
 
@@ -350,8 +341,8 @@ export function normalize(
 
         const civetLineText = civetLines[civetLineIndex];
         const searchText = anchor.text;
-          const cacheKey = `${civetLineIndex}:${searchText}`;
-          const consumedCount = consumedMatchCount.get(cacheKey) || 0;
+        const cacheKey = `${civetLineIndex}:${searchText}`;
+        const consumedCount = consumedMatchCount.get(cacheKey) || 0;
 
         const civetColumn = locateTokenInCivetLine(civetLineText, searchText, anchor.kind, consumedCount);
         if (civetColumn === undefined) continue;
@@ -364,7 +355,7 @@ export function normalize(
             log(`  Mapped to Civet: L${origLine + 1}:C${origCol}`);
         }
 
-            consumedMatchCount.set(cacheKey, consumedCount + 1);
+        consumedMatchCount.set(cacheKey, consumedCount + 1);
 
         const { text } = anchor;
         const origLine = civetLineIndex + civetContentStartLine -1;
@@ -383,35 +374,24 @@ export function normalize(
             });
         }
 
-        // Add explicit null mappings for whitespace around identifiers to prevent bleed
         const lineText = tsLines[genLine] || '';
-        
-        // Before the identifier
-        if (genCol > 0 && /\s/.test(lineText[genCol - 1])) {
-            addMapping(gen, {
-                generated: { line: genLine + 1, column: genCol - 1 },
-                source: civetSource,
-                original: { line: origLine + 1, column: origCol - 1 },
-                name: undefined
-            });
-        }
-
-        // After the identifier
+        // After the identifier: map the next symbol (whitespace, comma, semicolon, etc.) to the next Svelte column if available
         const afterIdx = genCol + text.length;
-        if (afterIdx < lineText.length && /\s/.test(lineText[afterIdx])) {
+        const origAfterIdx = origCol + text.length;
+        if (afterIdx < lineText.length) {
             addMapping(gen, {
                 generated: { line: genLine + 1, column: afterIdx },
                 source: civetSource,
-                original: { line: origLine + 1, column: origCol + text.length },
+                original: { line: origLine + 1, column: origAfterIdx },
                 name: undefined
             });
         }
       }
 
     // ---------------------------------------------------------------------
-    // Final pass: Insert explicit null mappings for whitespace characters
+    // Final pass: Insert explicit null mappings for characters
     // that still do not have a mapping. This prevents range-bleed where the
-    // mapping of a preceding token continues over trailing whitespace.
+    // mapping of a preceding token continues over trailing whitespace or operators.
     // ---------------------------------------------------------------------
     tsLines.forEach((lineText, tsLineIdx) => {
         let usedCols = usedGenPositions.get(tsLineIdx);
@@ -422,14 +402,13 @@ export function normalize(
 
         for (let col = 0; col < lineText.length; col++) {
             const ch = lineText[col];
-            if (!/\s/.test(ch)) continue;
             if (usedCols.has(col)) continue; // already mapped
 
             addMapping(gen, {
                 generated: { line: tsLineIdx + 1, column: col }
             });
             if (shouldLog && tsLineIdx === problemLineIdx) {
-                log(`    [NULL-MAP] Added null mapping for whitespace TSX L${tsLineIdx+1}:C${col}`);
+                log(`    [NULL-MAP] Added null mapping for unmapped TSX L${tsLineIdx+1}:C${col}`);
             }
             usedCols.add(col);
         }
@@ -438,8 +417,52 @@ export function normalize(
     const map = toEncodedMap(gen);
     map.sourcesContent = civetMap.sourcesContent;
 
-      if (DEBUG_DENSE_MAP) {
-        logFullDenseMap(map, tsCode, civetContent);
+    // === FINAL DEDUPLICATION SWEEP ===
+    // For each generated (line, column), keep only the first mapping; null-map the rest
+    if (map.mappings && Array.isArray(map.mappings)) {
+        // Defensive: if already decoded
+        const seen = new Set<string>();
+        for (let lineIdx = 0; lineIdx < map.mappings.length; lineIdx++) {
+            const line = map.mappings[lineIdx];
+            if (!Array.isArray(line)) continue;
+            for (let i = 0; i < line.length; i++) {
+                const seg = line[i];
+                if (seg.length < 1) continue;
+                const genCol = seg[0];
+                const key = `${lineIdx}:${genCol}`;
+                if (seen.has(key)) {
+                    // Null-map: keep only the generated position
+                    map.mappings[lineIdx][i] = [genCol];
+                } else {
+                    seen.add(key);
+                }
+            }
+        }
+    } else if (typeof map.mappings === 'string') {
+        // If still encoded, decode, deduplicate, then re-encode
+        const { decode, encode } = require('@jridgewell/sourcemap-codec');
+        let decoded = decode(map.mappings);
+        const seen = new Set<string>();
+        for (let lineIdx = 0; lineIdx < decoded.length; lineIdx++) {
+            const line = decoded[lineIdx];
+            for (let i = 0; i < line.length; i++) {
+                const seg = line[i];
+                if (seg.length < 1) continue;
+                const genCol = seg[0];
+                const key = `${lineIdx}:${genCol}`;
+                if (seen.has(key)) {
+                    // Null-map: keep only the generated position
+                    decoded[lineIdx][i] = [genCol];
+                } else {
+                    seen.add(key);
+                }
+            }
+        }
+        map.mappings = encode(decoded);
+    }
+
+    if (DEBUG_DENSE_MAP) {
+      logFullDenseMap(map, tsCode, civetContent);
     }
 
     return map;
