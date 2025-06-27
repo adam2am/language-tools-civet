@@ -1,669 +1,446 @@
-import { GenMapping, setSourceContent, addMapping, toEncodedMap } from '@jridgewell/gen-mapping';
+import { GenMapping, toEncodedMap, addMapping, setSourceContent } from '@jridgewell/gen-mapping';
 import type { EncodedSourceMap } from '@jridgewell/gen-mapping';
-import type { LinesMap } from '../types';
-import * as ts from 'typescript';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
-// avoid unused-import linter errors
-if (ts) { /* noop */ }
+import { decode } from '@jridgewell/sourcemap-codec';
+
+// Define local types to avoid dependency issues
+export interface SvelteFile {
+    getText(): string;
+    filename: string;
+}
+export type CivetCompileOptions = Record<string, any>;
+
+const DEBUG_DENSE_MAP = false;
+const logFullDenseMap = (..._args: any[]) => {}; // No-op for now
 
 function locateTokenInCivetLine(
-  anchor: Anchor,
   civetLineText: string,
-  consumedCount: number,
-  operatorLookup: Record<string, string>,
-  debug: boolean
+    searchText: string,
+    kind: Anchor['kind'],
+    consumedCount: number
 ): number | undefined {
-  const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
   let foundIndex = -1;
+    let searchOffset = 0;
 
-  if (debug) {
-    console.log(`[BUG_HUNT] Searching for "${searchText}" (anchor: "${anchor.text}", kind: ${anchor.kind}). Consumed: ${consumedCount}. Line content: "${civetLineText}"`);
-  }
-
-  if (anchor.kind === 'identifier') {
-    if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier.`);
-    const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
-    if (debug) console.log(`[FIX_VERIFY] Constructed regex: ${searchRegex}`);
-
-    for (let j = 0; j <= consumedCount; j++) {
-      const match = searchRegex.exec(civetLineText);
-      if (debug) {
-        console.log(`[FIX_VERIFY_ITER] j=${j}: Match result: ${match ? `found at index ${match.index}` : 'null'}`);
-      }
-      if (!match) {
+    for (let i = 0; i <= consumedCount; i++) {
+        if (kind === 'identifier') {
+            const regex = new RegExp(`(?<![\\p{L}\\p{N}_$])${searchText}(?![\\p{L}\\p{N}_$])`, 'u');
+            const match = civetLineText.substring(searchOffset).match(regex);
+            if (match) {
+                foundIndex = (match.index ?? 0) + searchOffset;
+                searchOffset = foundIndex + match[0].length;
+            } else {
         foundIndex = -1;
         break;
       }
-      foundIndex = match.index;
-    }
-  } else if (anchor.kind === 'operator') {
-    if (debug) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
-    const operatorRegex = new RegExp(`\\s*${searchText.trim()}\\s*`, 'g');
-    let searchOffset = 0;
-    for (let j = 0; j <= consumedCount; j++) {
-      operatorRegex.lastIndex = searchOffset;
-      const match = operatorRegex.exec(civetLineText);
-      if (!match) {
+        } else {
+            const index = civetLineText.indexOf(searchText, searchOffset);
+            if (index !== -1) {
+                foundIndex = index;
+                searchOffset = index + searchText.length;
+            } else {
         foundIndex = -1;
         break;
       }
-      const fullMatch = match[0];
-      const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-      foundIndex = match.index + leadingSpace;
-      searchOffset = match.index + fullMatch.length;
-    }
-  } else {
-    if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
-    let searchOffset = 0;
-    for (let j = 0; j <= consumedCount; j++) {
-      foundIndex = civetLineText.indexOf(searchText, searchOffset);
-      if (debug) {
-          console.log(`[BUG_HUNT_ITER] j=${j}: searchOffset=${searchOffset}, foundIndex=${foundIndex}`);
-      }
-      if (foundIndex === -1) break;
-      searchOffset = foundIndex + searchText.length;
-    }
-  }
-
-  if (debug) {
-    console.log(`[BUG_HUNT_RESULT] Final foundIndex for "${searchText}" is ${foundIndex}`);
+        }
   }
 
   return foundIndex !== -1 ? foundIndex : undefined;
 }
 
-function buildLookupTables(
-  tsAnchors: Anchor[],
-  civetMap: LinesMap,
-  civetCodeLines: string[]
-) {
-  // Exclude comment lines when detecting generated identifiers
-  const codeLines = civetCodeLines.filter(line => !line.trim().startsWith('//'));
-  
-  // Create a quick lookup to find the approximate Civet snippet line for a given TS line.
-  const tsLineToCivetLineMap = new Map<number, number>();
-  civetMap.lines.forEach((segments, tsLineIdx) => {
-    for (const seg of segments) {
-      if (seg.length >= 4) {
-        tsLineToCivetLineMap.set(tsLineIdx, seg[2]);
-        return;
-      }
-    }
-  });
+export function normalize(
+    civetMap: any,
+    tsCode: string,
+    svelteFile: SvelteFile,
+    _options: CivetCompileOptions,
+    civetContentStartLine: number,
+    indentLen: number,
+): EncodedSourceMap {
+    // --- Start of logging additions ---
+    const log = (msg: string) => console.log(`[MAP_DEBUG] ${msg}`);
+    const tsxLinesForLog = tsCode.split('\n');
+    const problemLineIdx = tsxLinesForLog.findIndex(l => l.includes('if (abc === query)'));
+    const shouldLog = problemLineIdx !== -1;
 
-  // Collect identifiers that are compiler-generated to map them to null.
-  const generatedIdentifiers = new Set<string>();
-  for (const anchor of tsAnchors) {
-    if (anchor.kind !== 'identifier') continue;
+    if (shouldLog) log('Normalization started for file with "abc = if..."');
+    // --- End of logging additions ---
+
+    if (!civetMap) {
+        return {
+            version: 3,
+            file: svelteFile.filename,
+            sources: [],
+            sourcesContent: [],
+            mappings: '',
+            names: [],
+        };
+    }
+
+    const civetSource = svelteFile.filename;
+    const civetContent = civetMap.source || '';
+
+    const civetLines = civetContent.split('\n');
     
-    // Always mark single-letter loop variables as generated
+    const anchors = collectAnchorsFromTs(tsCode, svelteFile.filename);
+
+    if (shouldLog) {
+        log(`Found ${anchors.length} anchors. Anchors on problem line (${problemLineIdx + 1}):`);
+        anchors.forEach(a => {
+            if (a.start.line === problemLineIdx) {
+                log(`  - "${a.text}" (kind: ${a.kind}) at col ${a.start.character}`);
+            }
+        });
+    }
+
+    // Prepare helper structures for pruning unwanted mappings
+    const skipColumnsByLine = new Map<number, Set<number>>();
+    const tsLines = tsCode.split('\n');
+
+    // --- Filter out compiler-generated identifiers ---
+    const generatedIdentifiers = new Set<string>();
+    const civetCodeText = civetLines.join('\n');
+    for (const anchor of anchors) {
+        if (anchor.kind === 'identifier') {
     if (anchor.text.length === 1 && /^[ijkn]$/.test(anchor.text)) {
       generatedIdentifiers.add(anchor.text);
+
+                // Record columns for this generated identifier before continuing
+                const { line: genLine, character: genCol } = anchor.start;
+                let cols = skipColumnsByLine.get(genLine);
+                if (!cols) {
+                    cols = new Set<number>();
+                    skipColumnsByLine.set(genLine, cols);
+                }
+                cols.add(genCol);
+                // Preceding whitespace
+                if (genCol > 0 && /\s/.test(tsLines[genLine]?.[genCol - 1] || '')) {
+                    cols.add(genCol - 1);
+                }
+                // Trailing whitespace
+                if (/\s/.test(tsLines[genLine]?.[genCol + 1] || '')) {
+                    cols.add(genCol + 1);
+                }
+
       continue;
     }
-
     const escapedText = anchor.text.replace(/[.*+?^${}()|[\\]\\]/g, '\\\\$&');
     const wordRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedText}(?![\\p{L}\\p{N}_$])`, 'u');
-    // Only consider code lines (ignore comments) when matching identifiers
-    if (!codeLines.some(line => wordRegex.test(line))) {
+            if (!wordRegex.test(civetCodeText)) {
       generatedIdentifiers.add(anchor.text);
-    }
-  }
+            }
 
-  // Group all anchors by their line number for sequential processing.
-  const anchorsByLine = new Map<number, Anchor[]>();
-  for (const anchor of tsAnchors) {
-    if (!anchorsByLine.has(anchor.start.line)) {
-      anchorsByLine.set(anchor.start.line, []);
-    }
-    anchorsByLine.get(anchor.start.line)!.push(anchor);
-  }
-  // Sort anchors within each line by column to process them in order.
-  for (const lineAnchors of anchorsByLine.values()) {
-    lineAnchors.sort((a, b) => a.start.character - b.start.character);
-  }
-
-  // Create sorted list of all non-generated identifiers for consistent name indexing
-  const names = Array.from(new Set(tsAnchors
-    .filter(a => a.kind === 'identifier' && !generatedIdentifiers.has(a.text))
-    .map(a => a.text)
-    .sort()
-  ));
-  
-  return { tsLineToCivetLineMap, generatedIdentifiers, anchorsByLine, names };
-}
-
-const DEBUG_DENSE_MAP = true; // Toggle for verbose dense-map generation logs (disabled for production)
-const DEBUG_NO_NAMES = true; // Experimental: When true, generates only 4-delta segments without name indices
-
-function getNameIndex(anchor: Anchor, names: string[], generatedIdentifiers: Set<string>): number {
-  return anchor.kind === 'identifier' && !generatedIdentifiers.has(anchor.text)
-    ? names.indexOf(anchor.text)
-    : -1;
-}
-
-export function buildDenseMapLines(
-  tsLines: string[],
-  anchorsByLine: Map<number, Anchor[]>,
-  generatedIdentifiers: Set<string>,
-  tsLineToCivetLineMap: Map<number, number>,
-  civetCodeLines: string[],
-  operatorLookup: Record<string, string>,
-  civetBlockStartLine: number,
-  indentation: number,
-  names: string[],
-  DEBUG_TOKEN: boolean
-) {
-  const decoded: number[][][] = [];
-  const consumedMatchCount = new Map<string, number>();
-
-  for (let i = 0; i < tsLines.length; i++) {
-    const lineAnchors = anchorsByLine.get(i) || [];
-    const lineSegments: number[][] = [];
-    let lastGenCol = 0;
-
-    for (const anchor of lineAnchors) {
-      if (DEBUG_DENSE_MAP) {
-        const nameIdxForLog = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
-        console.log(`\n[ANCHOR_PROCESS] Line ${i}, Col ${anchor.start.character}: Processing anchor text='${anchor.text}', kind='${anchor.kind}'. Name index: ${nameIdxForLog}`);
-        if (anchor.kind === 'identifier' && nameIdxForLog === -1) {
-          console.log(`[ANCHOR_WARN] Identifier '${anchor.text}' was not found in the 'names' array. It will not be mapped with a name.`)
+            // Record columns of generated identifiers (and surrounding whitespace) to prune
+            const { line: genLine, character: genCol } = anchor.start;
+            let cols = skipColumnsByLine.get(genLine);
+            if (!cols) {
+                cols = new Set<number>();
+                skipColumnsByLine.set(genLine, cols);
+            }
+            for (let i = 0; i < anchor.text.length; i++) {
+                cols.add(genCol + i);
+            }
+            // Include preceding whitespace if present
+            if (genCol > 0 && /\s/.test(tsLines[genLine]?.[genCol - 1] || '')) {
+                cols.add(genCol - 1);
+            }
+            // Include trailing whitespace if present
+            const afterIdx = genCol + anchor.text.length;
+            if (/\s/.test(tsLines[genLine]?.[afterIdx] || '')) {
+                cols.add(afterIdx);
+            }
         }
-      }
+    }
 
-      // --- Determine mapping for the current token ---
-      let isGenerated = false;
-      if (anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text)) {
-        isGenerated = true;
-      }
+    // ----------------------------------------------------------------------------
+    // Seed phase: create a GenMapping either from standard V3 map or raw `lines`
+    // ----------------------------------------------------------------------------
+    // Track which generated positions we have already seeded to avoid duplicates that
+    // could cause "bleed" (multiple Civet columns mapping to the same TS position).
+    const usedGenPositions = new Map<number, Set<number>>();
 
-      if (isGenerated) {
-        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Generated token '${anchor.text}' at ${i}:${anchor.start.character}`);
-        lineSegments.push([anchor.start.character]);
-        lastGenCol = anchor.end.character;
-        if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] GEN-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
-        continue;
-      }
+    let gen: GenMapping;
+    if (typeof civetMap.mappings === 'string') {
+        // Standard V3 map – manually seed to allow pruning of generated identifiers
+        gen = new GenMapping();
+        setSourceContent(gen, civetSource, civetContent);
 
-      // It's not a known generated token, so try to find its original position.
-      const civetLineIndex = tsLineToCivetLineMap.get(i);
-      if (civetLineIndex === undefined) {
-        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] No civet line for TS line ${i}, null mapping token '${anchor.text}'`);
-        lineSegments.push([anchor.start.character]);
-        lastGenCol = anchor.end.character;
-        continue;
-      }
+        const decoded = decode(civetMap.mappings);
 
-      const civetLineText = civetCodeLines[civetLineIndex] || '';
-      const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
-      const cacheKey = `${civetLineIndex}:${searchText}`;
-      const consumedCount = consumedMatchCount.get(cacheKey) || 0;
-      
-      const civetColumn = locateTokenInCivetLine(anchor, civetLineText, consumedCount, operatorLookup, DEBUG_DENSE_MAP);
-
-      if (civetColumn !== undefined) {
-        consumedMatchCount.set(cacheKey, consumedCount + 1);
-      }
-
-      if (civetColumn !== undefined) {
-        const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
-        const sourceSvelteStartCol = civetColumn + indentation;
-        const nameIdx = getNameIndex(anchor, names, generatedIdentifiers);
-        
-        const startSegment = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
-        if (nameIdx > -1) {
-            startSegment.push(nameIdx);
+        if (shouldLog) {
+            log('Seeding from standard V3 map.');
+            if (problemLineIdx < decoded.length) {
+                const problemLineRawSegs = decoded[problemLineIdx];
+                log(`Raw segments for TSX line ${problemLineIdx + 1} (len ${problemLineRawSegs?.length}): ${JSON.stringify(problemLineRawSegs)}`);
+            }
         }
-        lineSegments.push(startSegment);
-        
-        // Add a null mapping for the whitespace after the token
-        lineSegments.push([anchor.end.character]);
 
-        if (DEBUG_TOKEN && anchor.text === 'abc') {
-            console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
-            console.log(`- Token length: ${anchor.text.length}`);
-            console.log(`- TS Start: Column ${anchor.start.character}`);
-            console.log(`- Svelte Start: Column ${sourceSvelteStartCol}`);
-            console.log(`- Null whitespace mapping: [${anchor.end.character}]`);
-            console.log(`- Generated segments: ${JSON.stringify([startSegment, [anchor.end.character]])}\n`);
+        // First pass: seed all segments from raw map except those we'll overwrite
+        decoded.forEach((lineSegs: number[][], tsLineIdx: number) => {
+            lineSegs.forEach((seg) => {
+                if (seg.length >= 4) {
+                    const [genCol, , srcLine0, srcCol0] = seg;
+                    const skipCols = skipColumnsByLine.get(tsLineIdx);
+                    if (skipCols && skipCols.has(genCol)) {
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED] Skipping genCol ${genCol} on TSX L${tsLineIdx+1} due to generated-identifier prune`);
+                        }
+                        return; // prune
+                    }
+
+                    const ch = tsLines[tsLineIdx]?.[genCol] || '';
+                    const isWs = /\s/.test(ch);
+
+                    // Track/guard only non-whitespace – whitespace will be handled later with null mapping
+                    let usedCols = usedGenPositions.get(tsLineIdx);
+                    if (!usedCols) {
+                        usedCols = new Set<number>();
+                        usedGenPositions.set(tsLineIdx, usedCols);
+                    }
+
+                    if (!isWs && usedCols.has(genCol)) {
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED] Duplicate genCol ${genCol} on TSX L${tsLineIdx+1} – skipping to avoid bleed`);
+                        }
+                        return; // avoid duplicate mapping at same generated position for non-ws
+                    }
+
+                    if (!isWs) usedCols.add(genCol);
+
+                    if (isWs) {
+                        // Skip seeding whitespace – will add explicit null mapping later
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED] Skipping initial whitespace mapping for genCol ${genCol} on TSX L${tsLineIdx+1}`);
         }
       } else {
-        // Could not find in original line, treat as generated.
-        if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Could not find '${anchor.text}' in Civet line, null mapping at ${i}:${anchor.start.character}`);
-        lineSegments.push([anchor.start.character]);
-      }
+                        addMapping(gen, {
+                            generated: { line: tsLineIdx + 1, column: genCol },
+                            source: civetSource,
+                            original: { line: srcLine0 + 1, column: srcCol0 },
+                            name: undefined // Explicitly clear name for raw map segments
+                        });
+                    }
+                }
+            });
+        });
+    } else if (Array.isArray(civetMap.lines)) {
+        // Raw Civet `lines` map – seed manually
+        gen = new GenMapping();
+        setSourceContent(gen, civetSource, civetContent);
 
-      lastGenCol = anchor.end.character;
-      if (DEBUG_DENSE_MAP) console.log(`[RANGE_DEBUG] USER-TOKEN: anchor='${anchor.text}', start=${anchor.start.character}, end=${anchor.end.character}, finalEndCol=${anchor.end.character}. Updated lastGenCol to ${lastGenCol}.`);
-    }
+        civetMap.lines.forEach((lineSegs: number[][], tsLineIdx: number) => {
+            lineSegs.forEach((seg) => {
+                if (seg.length >= 4) {
+                    const [genCol, , srcLine0, srcCol0] = seg;
+                    const skipCols = skipColumnsByLine.get(tsLineIdx);
+                    if (skipCols && skipCols.has(genCol)) {
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED-RAW] Skipping genCol ${genCol} on TSX L${tsLineIdx+1} due to generated-identifier prune`);
+                        }
+                        return; // prune
+                    }
 
-    if (lineSegments.length > 0) {
-      if (DEBUG_DENSE_MAP) console.log(`[DENSE_LINE_DONE] Final segments for TS line ${i}: ${JSON.stringify(lineSegments)}`);
-      decoded.push(lineSegments);
-    } else {
-      // For completely empty lines, push an empty segment array
-      decoded.push([]);
-    }
-  }
-  return decoded;
-}
+                    const ch = tsLines[tsLineIdx]?.[genCol] || '';
+                    const isWs = /\s/.test(ch);
 
-/**
- * Normalize a Civet-specific sourcemap (CivetLinesSourceMap, from Civet snippet -> TS snippet)
- * to be a standard V3 RawSourceMap from Original Svelte File -> TS snippet.
- *
- * This function implements an "Anchor-Based" generation strategy. It discards the original
- * Civet `lines` map for mapping generation and instead builds a new map from scratch.
- * It uses identifiers found in the compiled TS AST as "anchors" and finds their
- * corresponding text in the original Civet snippet to create high-confidence mappings.
- * This ensures compiler-generated helper variables are never mapped.
- *
- * @param civetMap The CivetLinesSourceMap containing the `lines` array from `civet.compile()`.
- * @param svelteFileContent The full content of the original .svelte file.
- * @param civetBlockStartLine 1-based Svelte line where snippet starts
- * @param indentation number of spaces stripped from snippet indent
- * @param svelteFilePath The actual file path of the .svelte file (for the output sourcemap's `sources` and `file` fields).
- * @param tsCode optional TS snippet for AST-based enhancements
- * @returns A Standard V3 RawSourceMap that maps from the original .svelte file to the compiled TS snippet.
- */
-export function normalizeCivetMap(
-  civetMap: LinesMap,
-  svelteFileContent: string,
-  civetBlockStartLine: number, // 1-based Svelte line where snippet starts
-  indentation: number,           // number of spaces stripped from snippet indent
-  svelteFilePath: string,
-  tsCode?: string                // optional TS snippet for AST-based enhancements
-): EncodedSourceMap {
-  // Map TS operator tokens to their Civet equivalents. Defined up-front so the
-  // AST walker and later search logic can reference it safely.
-  const operatorLookup: Record<string, string> = {
-    '===': ' is ',
-    '!==': ' isnt ',
-    '&&':  ' and ',
-    '||':  ' or ',
-    '!':   'not '
-    // Extend as needed
-  };
+                    // Track/guard only non-whitespace – whitespace will be handled later with null mapping
+                    let usedCols = usedGenPositions.get(tsLineIdx);
+                    if (!usedCols) {
+                        usedCols = new Set<number>();
+                        usedGenPositions.set(tsLineIdx, usedCols);
+                    }
 
-  // Phase 1: Collect identifier anchors *and* import string-literal anchors from TS AST.
-  let tsAnchors: Anchor[] = [];
-  if (tsCode) {
-    try {
-      tsAnchors = collectAnchorsFromTs(tsCode, svelteFilePath, operatorLookup);
-    } catch (e) {
-      console.error(`[MAP_TO_V3 ${svelteFilePath}] Error parsing compiled TS for AST: ${(e as Error).message}`);
-    }
-  }
+                    if (!isWs && usedCols.has(genCol)) {
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED-RAW] Duplicate genCol ${genCol} on TSX L${tsLineIdx+1} – skipping to avoid bleed`);
+                        }
+                        return; // avoid duplicate mapping at same generated position for non-ws
+                    }
 
-  // ---------------------------------------------------------------------------
-  // Phase 2: AST-Driven Dense Map Generation
-  //
-  // This strategy abandons "post-processing" in favor of building a correct,
-  // dense sourcemap in a single pass. It iterates through the collected TS
-  // anchors and, for every token, explicitly decides whether to map it to the
-  // original source or to null. Gaps between tokens are also filled with null
-  // mappings. This prevents "fall-through" errors in chained sourcemap consumers.
-  // ---------------------------------------------------------------------------
+                    if (!isWs) usedCols.add(genCol);
 
-  if (DEBUG_DENSE_MAP) {
-    console.log(`\n--- [DEBUG] ORIGINAL CIVET COMPILER MAP (DECODED) ---`);
-    if (civetMap.lines) {
-        civetMap.lines.forEach((lineSegments, index) => {
-            const segmentsStr = lineSegments.map(seg => `[${seg.join(',')}]`).join('');
-            console.log(`Civet Original -> TS Line ${index}: ${segmentsStr}`);
+                    if (isWs) {
+                        // Skip seeding whitespace – will add explicit null mapping later
+                        if (shouldLog && tsLineIdx === problemLineIdx) {
+                            log(`    [SEED-RAW] Skipping initial whitespace mapping for genCol ${genCol} on TSX L${tsLineIdx+1}`);
+                        }
+                    } else {
+                        addMapping(gen, {
+                            generated: { line: tsLineIdx + 1, column: genCol },
+                            source: civetSource,
+                            original: { line: srcLine0 + 1, column: srcCol0 },
+                            name: undefined // Explicitly clear name for raw map segments
+                        });
+                    }
+                }
+            });
         });
     } else {
-        console.log("No 'lines' found in original Civet map.");
+        // Fallback: empty GenMapping
+        gen = new GenMapping();
+        setSourceContent(gen, civetSource, civetContent);
     }
-    console.log(`--- END ORIGINAL CIVET MAP ---\n`);
-  }
 
-  let outputMap: EncodedSourceMap = {
-    version: 3,
-    file: svelteFilePath,
-    sources: [svelteFilePath],
-    sourcesContent: [svelteFileContent],
-    mappings: '',
-    names: [],
-  };
+    const tsLineToCivetLineMap = new Map<number, number>();
+    if (civetMap.mappings) {
+        const decoded = typeof civetMap.mappings === 'string' ? decode(civetMap.mappings) : civetMap.mappings;
+        decoded.forEach((line: any[], tsLineIdx: number) => {
+            for (const seg of line) {
+                if (seg.length >= 4) {
+                    tsLineToCivetLineMap.set(tsLineIdx, seg[2]);
+                    return;
+                }
+            }
+        });
+    } else if (Array.isArray(civetMap.lines)) {
+        civetMap.lines.forEach((lineSegs: number[][], tsLineIdx: number) => {
+            for (const seg of lineSegs) {
+                if (seg.length >= 4) {
+                    tsLineToCivetLineMap.set(tsLineIdx, seg[2]);
+                    return;
+                }
+            }
+        });
+    }
 
-  if (!tsCode || !civetMap.lines) {
-    return outputMap;
-  }
-
-  // ------------------------ NEW GEN-MAPPING IMPLEMENTATION ------------------------
-  const gen = new GenMapping({ file: svelteFilePath });
-  setSourceContent(gen, svelteFilePath, svelteFileContent);
-
-  const civetCodeLines = (civetMap.source || '').split('\n');
-  const tsLines = tsCode.split('\n');
-
-  const {
-    tsLineToCivetLineMap,
-    generatedIdentifiers,
-    anchorsByLine,
-    names
-  } = buildLookupTables(tsAnchors, civetMap, civetCodeLines);
-
+    // Second pass: process anchors to overwrite identifier mappings with precise character positions
   const consumedMatchCount = new Map<string, number>();
 
-  // ----- Optional debug: show how identifiers are assigned name indices -----
-  if (DEBUG_DENSE_MAP) {
-    console.log("\n=== NAME INDEX TABLE ===");
-    names.forEach((n, i) => console.log(`${i}: ${n}`));
-    console.log("=== END NAME INDEX TABLE ===\n");
-  }
+    for (const anchor of anchors) {
+        const { line: genLine, character: genCol } = anchor.start;
 
-  // Iterate over each TS line and its anchors to build mappings
-  for (let tsLineIdx = 0; tsLineIdx < tsLines.length; tsLineIdx++) {
-    const lineAnchors = anchorsByLine.get(tsLineIdx) || [];
-    for (let j = 0; j < lineAnchors.length; j++) {
-      const anchor = lineAnchors[j];
+        if (generatedIdentifiers.has(anchor.text)) {
+            // For generated identifiers like loop variable "i", ensure that both the identifier
+            // itself *and* the whitespace directly surrounding it do NOT map back to Civet.
+            // We do this by explicitly adding mappings that point to { line: -1, column: -1 } which
+            // SourceMap consumers interpret as "no mapping".
 
-      if (DEBUG_DENSE_MAP) {
-        const nameIdxForLog = anchor.kind === 'identifier' ? anchor.text : '-';
-        console.log(`\n[TOKEN_MAP] Line ${tsLineIdx}, Col ${anchor.start.character}:`);
-        console.log(`- Token: '${anchor.text}' (${anchor.kind})`);
-        console.log(`- Name: ${nameIdxForLog}`);
-      }
+            const lineText = tsLines[genLine] || '';
 
-      // Determine if the identifier is compiler generated
-      const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
+            // Overwrite the identifier characters with an explicit null mapping
+            for (let i = 0; i < anchor.text.length; i++) {
+                addMapping(gen, {
+                    generated: { line: genLine + 1, column: genCol + i }
+                });
+            }
 
-      // Compute name index for non-generated identifiers (needed for debug logging)
-      const nameIdx = anchor.kind === 'identifier' && !isGenerated ? names.indexOf(anchor.text) : -1;
+            // Also overwrite the immediate preceding whitespace so that a test which
+            // probes the string " i " does not pick up an old mapping.
+            if (genCol > 0 && /\s/.test(lineText[genCol - 1])) {
+                addMapping(gen, {
+                    generated: { line: genLine + 1, column: genCol - 1 }
+                });
+            }
 
-      if (DEBUG_DENSE_MAP && isGenerated) {
-        console.log(`- Status: Generated token`);
-      }
+            // And the whitespace right after the identifier, if any.
+            const afterIdx = genCol + anchor.text.length;
+            if (afterIdx < lineText.length && /\s/.test(lineText[afterIdx])) {
+                addMapping(gen, {
+                    generated: { line: genLine + 1, column: afterIdx }
+                });
+            }
 
-      // Find corresponding Civet position if not generated
-      let origLine: number | undefined;
-      let origCol: number | undefined;
-      if (!isGenerated) {
-        const civetLineIndex = tsLineToCivetLineMap.get(tsLineIdx);
-        if (civetLineIndex !== undefined) {
-          const civetLineText = civetCodeLines[civetLineIndex] || '';
+            continue;
+        }
 
-          const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
+        // Only process identifier anchors - let raw map handle operators and whitespace
+        if (anchor.kind !== 'identifier') continue;
+
+        const civetLineIndex = tsLineToCivetLineMap.get(genLine);
+        if (civetLineIndex === undefined) continue;
+
+        const civetLineText = civetLines[civetLineIndex];
+        const searchText = anchor.text;
           const cacheKey = `${civetLineIndex}:${searchText}`;
           const consumedCount = consumedMatchCount.get(cacheKey) || 0;
 
-          const civetColumn = locateTokenInCivetLine(
-            anchor,
-            civetLineText,
-            consumedCount,
-    operatorLookup,
-            false
-          );
+        const civetColumn = locateTokenInCivetLine(civetLineText, searchText, anchor.kind, consumedCount);
+        if (civetColumn === undefined) continue;
 
-          if (civetColumn !== undefined) {
+        if (shouldLog && genLine === problemLineIdx) {
+            const origLine = civetLineIndex + civetContentStartLine -1;
+            const origCol = civetColumn + indentLen;
+            log(`Processing anchor "${anchor.text}" (kind: ${anchor.kind}) on problem line.`);
+            log(`  TSX Pos: L${genLine + 1}:C${genCol}`);
+            log(`  Mapped to Civet: L${origLine + 1}:C${origCol}`);
+        }
+
             consumedMatchCount.set(cacheKey, consumedCount + 1);
-            origLine = (civetBlockStartLine - 1) + civetLineIndex; // 0-based
-            origCol = civetColumn + indentation;
 
-            if (DEBUG_DENSE_MAP) {
-              console.log(`- Mapped to: Line ${origLine + 1}, Col ${origCol}`);
-              console.log(`- Original context: "${civetLineText.trim()}"`);
+        const { text } = anchor;
+        const origLine = civetLineIndex + civetContentStartLine -1;
+        const origCol = civetColumn + indentLen;
+
+        // For identifiers, we want precise per-character mappings
+        for (let i = 0; i < text.length; i++) {
+            if (shouldLog && genLine === problemLineIdx) {
+                log(`    -> Overwriting TSX L${genLine + 1}:C${genCol + i}  ==>  Svelte L${origLine + 1}:C${origCol + i}`);
             }
-          } else if (DEBUG_DENSE_MAP) {
-            console.log(`- Status: Not found in source`);
-          }
-        } else if (DEBUG_DENSE_MAP) {
-          console.log(`- Status: No corresponding Civet line`);
-        }
-      }
-
-      if (DEBUG_DENSE_MAP) {
-        console.log(`[TOKEN_BOUNDARY_DEBUG] Processing token '${anchor.text}':`);
-        console.log(`- Generated position: L${tsLineIdx + 1}:C${anchor.start.character}-${anchor.end.character}`);
-        if (origLine !== undefined) {
-          console.log(`- Original position: L${origLine + 1}:C${origCol}`);
-          console.log(`- Token length: ${anchor.text.length}`);
-          console.log(`- Next token starts at: ${j + 1 < lineAnchors.length ? lineAnchors[j + 1].start.character : 'EOL'}`);
-        }
-      }
-
-      // 1) Mapping at the start of the token
-      addMapping(gen, {
-        generated: { line: tsLineIdx + 1, column: anchor.start.character },
-        source: origLine !== undefined ? svelteFilePath : undefined,
-        original:
-          origLine !== undefined ? { line: origLine + 1, column: origCol! } : undefined,
-        name: origLine !== undefined && anchor.kind === 'identifier' ? anchor.text : undefined,
-      });
-
-      if (DEBUG_DENSE_MAP) {
-        console.log(`[MAPPING_DEBUG] Start mapping for '${anchor.text}':`);
-        console.log(JSON.stringify({
-          gen: { line: tsLineIdx + 1, col: anchor.start.character },
-          orig: origLine !== undefined ? { line: origLine + 1, col: origCol } : 'null',
-          name: origLine !== undefined && anchor.kind === 'identifier' ? anchor.text : undefined
-        }, null, 2));
-      }
-
-      // 2) Add character-by-character mappings for multi-character tokens
-      if (origLine !== undefined && anchor.text.length > 1) {
-        for (let charIdx = 1; charIdx < anchor.text.length; charIdx++) {
-  if (DEBUG_DENSE_MAP) {
-            console.log(`[CHAR_MAPPING] Mapping character ${charIdx} of '${anchor.text}' at TSX col ${anchor.start.character + charIdx} to Svelte col ${origCol! + charIdx}`);
-          }
-          addMapping(gen, {
-            generated: { line: tsLineIdx + 1, column: anchor.start.character + charIdx },
-            source: svelteFilePath,
-            original: { line: origLine + 1, column: origCol! + charIdx }
-          });
-        }
-      }
-
-      // 3) Add explicit terminator mapping after the token
-      const nextAnchorStart = j + 1 < lineAnchors.length ? lineAnchors[j + 1].start.character : undefined;
-      if (nextAnchorStart === undefined || anchor.end.character < nextAnchorStart) {
-        if (DEBUG_DENSE_MAP) {
-          console.log(`[TERMINATOR_DEBUG] Adding terminator after '${anchor.text}':`);
-          console.log(`- At column: ${anchor.end.character}`);
-          console.log(`- Next token starts at: ${nextAnchorStart || 'EOL'}`);
-  }
-
-        // First, map the end of the token to its original end position
-        if (origLine !== undefined) {
-          const lastCharCol = origCol! + anchor.text.length - 1;
-          addMapping(gen, {
-            generated: { line: tsLineIdx + 1, column: anchor.end.character - 1 },
-            source: svelteFilePath,
-            original: { line: origLine + 1, column: lastCharCol }
-          });
-
-          // Calculate how many columns until the next anchor OR end-of-line
-          const currentLineLength = tsLines[tsLineIdx].length;
-          const gap = nextAnchorStart !== undefined
-            ? Math.max(0, nextAnchorStart - anchor.end.character - 1)
-            : Math.max(0, currentLineLength - anchor.end.character - 1);
-
-          if (gap > 0) {
-            if (DEBUG_DENSE_MAP) {
-              console.log(`[GAP_DEBUG] Gap of ${gap} char(s) detected after token '${anchor.text}' on TS Line ${tsLineIdx + 1}.`);
-              console.log(`[GAP_DEBUG]   • First gap char (genCol ${anchor.end.character}) will map to Svelte L${origLine + 1}:C${origCol + anchor.text.length}` +
-                          ` (preserves real whitespace position).`);
-              if (gap > 1) {
-                console.log(`[GAP_DEBUG]   • Remaining ${gap - 1} char(s) will map to column 0 to terminate range.`);
-              }
-            }
-            // First gap char: map to actual position (C17 after abc)
             addMapping(gen, {
-              generated: { line: tsLineIdx + 1, column: anchor.end.character },
-              source: svelteFilePath,
-              original: { line: origLine + 1, column: origCol + anchor.text.length }
+                generated: { line: genLine + 1, column: genCol + i },
+                source: civetSource,
+                original: { line: origLine + 1, column: origCol + i },
+                name: anchor.text
             });
-
-            // All subsequent gap chars: force to C0 to prevent bleed
-            if (gap > 1) {
-              if (DEBUG_DENSE_MAP) {
-                console.log(`[GAP_FILL] Mapping generated col ${anchor.end.character + 1}..${anchor.end.character + gap - 1}` +
-                            ` to Svelte column 0 (origLine ${origLine + 1}).`);
-              }
-              addMapping(gen, {
-                generated: { line: tsLineIdx + 1, column: anchor.end.character + 1 },
-                source: svelteFilePath,
-                original: { line: origLine + 1, column: 0 }  // Force to C0
-              });
-            }
-          } else {
-            // No gap or unknown gap (e.g., end-of-line). Emit single null terminator one char after token.
-            addMapping(gen, {
-              generated: { line: tsLineIdx + 1, column: anchor.end.character + 1 }
-            });
-          }
-
-          if (DEBUG_DENSE_MAP) {
-            console.log(`[RANGE_DEBUG] Token '${anchor.text}':`);
-            console.log(`- Start: TSX L${tsLineIdx + 1}:C${anchor.start.character} -> Svelte L${origLine + 1}:C${origCol}`);
-            console.log(`- End: TSX L${tsLineIdx + 1}:C${anchor.end.character - 1} -> Svelte L${origLine + 1}:C${lastCharCol}`);
-          }
-        } else {
-          // For generated tokens, just add a null mapping (but avoid colliding with the next anchor)
-          if (nextAnchorStart === undefined || anchor.end.character < nextAnchorStart) {
-            addMapping(gen, {
-              generated: { line: tsLineIdx + 1, column: anchor.end.character }
-            });
-          }
         }
-      }
 
-      if (DEBUG_DENSE_MAP) {
-        console.log(`\nProcessing token: '${anchor.text}' (${anchor.kind})`);
-        if (anchor.kind === 'identifier') {
-          console.log(`- Generated: ${generatedIdentifiers.has(anchor.text)}`);
-          console.log(`- Name index lookup: '${anchor.text}' -> ${nameIdx}`);
-          if (nameIdx === -1 && !generatedIdentifiers.has(anchor.text)) {
-            console.log(`  WARNING: Non-generated identifier not found in names array!`);
-          }
-        }
-      }
-    }
-  }
-
-  const finalMap = toEncodedMap(gen) as EncodedSourceMap;
-
-  if (DEBUG_DENSE_MAP) {
-    // Create a structured view of all mappings
-    const decodedStructure = tsLines.map((_, lineIdx) => {
-      const lineAnchors = anchorsByLine.get(lineIdx) || [];
-      return lineAnchors.map(anchor => {
-        const civetLineIndex = tsLineToCivetLineMap.get(lineIdx);
-        const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
-        const origLine = !isGenerated && civetLineIndex !== undefined ? 
-          (civetBlockStartLine - 1) + civetLineIndex : undefined;
-        const origCol = origLine !== undefined ? 
-          locateTokenInCivetLine(anchor, civetCodeLines[civetLineIndex!] || '', 0, operatorLookup, false) : undefined;
-
-        return {
-          token: anchor.text,
-          kind: anchor.kind,
-          genLine: lineIdx + 1,
-          genCol: anchor.start.character,
-          origLine: origLine !== undefined ? origLine + 1 : null,
-          origCol: origCol !== undefined ? origCol + indentation : null,
-          name: origLine !== undefined && anchor.kind === 'identifier' ? anchor.text : null
-        };
-      });
-    });
-
-    console.log('\n=== FULL MAPPING STRUCTURE ===');
-    decodedStructure.forEach((line, idx) => {
-      if (line.length > 0) {
-        console.log(`\nLine ${idx + 1} Mappings:`);
-        console.log(JSON.stringify(line, null, 2));
-      }
-    });
-
-    // Show compact line-by-line structure
-    console.log('\n=== COMPACT LINE STRUCTURE ===');
-    decodedStructure.forEach((line, idx) => {
-      const segments = line.map(m => 
-        `[${m.token}${m.origLine ? `->${m.origLine}:${m.origCol}` : '->null'}]`
-      );
-      if (segments.length > 0) {
-        console.log(`Line ${idx + 1}: ${segments.join(' ')}`);
-      }
-    });
-
-    // Add raw decoded segments view
-    console.log('\n=== RAW DECODED SEGMENTS ===');
-    const rawSegments = tsLines.map((_, lineIdx) => {
-      const lineAnchors = anchorsByLine.get(lineIdx) || [];
-      const segments: number[][] = [];
-      
-      lineAnchors.forEach(anchor => {
-        const civetLineIndex = tsLineToCivetLineMap.get(lineIdx);
-        const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
+        // Add explicit null mappings for whitespace around identifiers to prevent bleed
+        const lineText = tsLines[genLine] || '';
         
-        if (isGenerated) {
-          segments.push([anchor.start.character]);
-          segments.push([anchor.end.character]);
-        } else if (civetLineIndex !== undefined) {
-          const origCol = locateTokenInCivetLine(anchor, civetCodeLines[civetLineIndex] || '', 0, operatorLookup, false);
-          if (origCol !== undefined) {
-            const origLine = (civetBlockStartLine - 1) + civetLineIndex;
-            const startSegment = [
-              anchor.start.character,
-              0,
-              origLine,
-              origCol + indentation
-            ];
-
-            // Add name index for non-generated identifiers
-            if (!DEBUG_NO_NAMES && anchor.kind === 'identifier' && !generatedIdentifiers.has(anchor.text)) {
-              const nameIdx = names.indexOf(anchor.text);
-              if (nameIdx !== -1) {
-                startSegment.push(nameIdx);
-  }
-            }
-            segments.push(startSegment);
-
-            // End segment (position only, no name index)
-            const endCol = origCol + indentation + (anchor.text.length - 1);
-            segments.push([
-              anchor.end.character - 1,
-              0,
-              origLine,
-              endCol
-            ]);
-
-            // Add whitespace mapping after token - same line, next column
-            segments.push([
-              0,
-              0,
-              origLine,
-              endCol + 1
-            ]);
-          } else {
-            segments.push([anchor.start.character]);
-            segments.push([anchor.end.character]);
-            // For unmapped tokens in a known line, use that line number
-            if (civetLineIndex !== undefined) {
-              segments.push([0, 0, (civetBlockStartLine - 1) + civetLineIndex, 0]);
-            } else {
-              segments.push([0, 0, 0, 1]);
-            }
-          }
-        } else {
-          segments.push([anchor.start.character]);
-          segments.push([anchor.end.character]);
-          segments.push([0, 0, 0, 1]);
+        // Before the identifier
+        if (genCol > 0 && /\s/.test(lineText[genCol - 1])) {
+            addMapping(gen, {
+                generated: { line: genLine + 1, column: genCol - 1 },
+                source: civetSource,
+                original: { line: origLine + 1, column: origCol - 1 },
+                name: undefined
+            });
         }
-      });
-      
-      return segments;
-    });
 
-    rawSegments.forEach((line, idx) => {
-      if (line.length > 0) {
-        console.log(`Line ${idx + 1}: ${line.map(seg => JSON.stringify(seg)).join('')}`);
+        // After the identifier
+        const afterIdx = genCol + text.length;
+        if (afterIdx < lineText.length && /\s/.test(lineText[afterIdx])) {
+            addMapping(gen, {
+                generated: { line: genLine + 1, column: afterIdx },
+                source: civetSource,
+                original: { line: origLine + 1, column: origCol + text.length },
+                name: undefined
+            });
+        }
       }
-    });
-  }
 
-  return finalMap;
+    // ---------------------------------------------------------------------
+    // Final pass: Insert explicit null mappings for whitespace characters
+    // that still do not have a mapping. This prevents range-bleed where the
+    // mapping of a preceding token continues over trailing whitespace.
+    // ---------------------------------------------------------------------
+    tsLines.forEach((lineText, tsLineIdx) => {
+        let usedCols = usedGenPositions.get(tsLineIdx);
+        if (!usedCols) {
+            usedCols = new Set<number>();
+            usedGenPositions.set(tsLineIdx, usedCols);
+        }
+
+        for (let col = 0; col < lineText.length; col++) {
+            const ch = lineText[col];
+            if (!/\s/.test(ch)) continue;
+            if (usedCols.has(col)) continue; // already mapped
+
+            addMapping(gen, {
+                generated: { line: tsLineIdx + 1, column: col }
+            });
+            if (shouldLog && tsLineIdx === problemLineIdx) {
+                log(`    [NULL-MAP] Added null mapping for whitespace TSX L${tsLineIdx+1}:C${col}`);
+            }
+            usedCols.add(col);
+        }
+    });
+
+    const map = toEncodedMap(gen);
+    map.sourcesContent = civetMap.sourcesContent;
+
+      if (DEBUG_DENSE_MAP) {
+        logFullDenseMap(map, tsCode, civetContent);
+    }
+
+    return map;
 }

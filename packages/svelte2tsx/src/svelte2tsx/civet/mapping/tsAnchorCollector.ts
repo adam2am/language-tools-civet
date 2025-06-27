@@ -12,8 +12,7 @@ export interface Anchor {
 
 export function collectAnchorsFromTs(
     tsCode: string,
-    svelteFilePath: string,
-    OPERATOR_MAP: Record<string, string>
+    svelteFilePath: string
 ): Anchor[] {
     const tsAnchors: Anchor[] = [];
     const tsSourceFile = ts.createSourceFile(
@@ -49,17 +48,6 @@ export function collectAnchorsFromTs(
             const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
             const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
             tsAnchors.push({ text: numText, start, end, kind: 'numericLiteral' });
-        }
-
-        // Operators and Punctuation
-        if (ts.isToken(node) && node.kind >= ts.SyntaxKind.FirstPunctuation && node.kind <= ts.SyntaxKind.LastPunctuation) {
-            const operatorText = node.getText(tsSourceFile);
-            // Only collect operators we know how to map back to Civet text
-            if (OPERATOR_MAP.hasOwnProperty(operatorText)) {
-                const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
-                const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
-                tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
-            }
         }
 
         node.getChildren(tsSourceFile).forEach(findAnchors);
