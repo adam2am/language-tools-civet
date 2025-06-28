@@ -181,7 +181,6 @@ function buildDenseMapLines(
 
     for (let aIdx = 0; aIdx < lineAnchors.length; aIdx++) {
       const anchor = lineAnchors[aIdx];
-      const nextAnchorStart = aIdx + 1 < lineAnchors.length ? lineAnchors[aIdx + 1].start.character : undefined;
 
       // --- Fill gap before this token with a null mapping ---
       if (anchor.start.character > lastGenCol) {
@@ -238,10 +237,7 @@ function buildDenseMapLines(
 
         // Point 2: Add an edge mapping at the column right after the token (unique per token).
         const genEdgeCol = anchor.end.character; // first char AFTER the token
-        if (nextAnchorStart !== genEdgeCol) {
-          // Only add edge mapping if it doesn't collide with the start of the next token.
-          lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
-        }
+        lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
 
         // Point 1: Map token start
         const startSegment: number[] = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];

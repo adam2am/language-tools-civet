@@ -84,7 +84,29 @@ export function collectAnchorsFromTs(
         node.getChildren(tsSourceFile).forEach(findAnchors);
     }
     findAnchors(tsSourceFile);
-    return tsAnchors;
+
+    // ---------------------------------------------------------------------
+    // De-duplicate overlapping anchors, preferring the semantic information
+    // from the AST walk (identifiers) over the scanner's token kind.
+    // This resolves cases like `is` which may be reported both as a keyword
+    // by the scanner and as an identifier by the AST when `objectIs` helper
+    // injection is enabled.
+    // ---------------------------------------------------------------------
+    const bySpan = new Map<string, Anchor>();
+    for (const a of tsAnchors) {
+        const key = `${a.start.line}:${a.start.character}:${a.end.character}`;
+        const existing = bySpan.get(key);
+        if (!existing) {
+            bySpan.set(key, a);
+            continue;
+        }
+        // Keep identifier over anything else; otherwise keep first seen.
+        if (existing.kind !== 'identifier' && a.kind === 'identifier') {
+            bySpan.set(key, a);
+        }
+    }
+
+    return Array.from(bySpan.values());
 }
 
 export {}; 
