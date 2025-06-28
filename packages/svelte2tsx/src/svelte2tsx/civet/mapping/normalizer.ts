@@ -95,10 +95,8 @@ export function normalize(
     civetContentStartLine: number,
     indentLen: number,
 ): EncodedSourceMap {
-    // --- Debug logging setup ---
-    const log = (msg: string) => console.log(`[MAP_DEBUG] ${msg}`);
-    const shouldLog = tsCode.includes('if (abc === query)');
-    if (shouldLog) log('Starting Two-Pass Rebuild normalization');
+    const log = (_msg: string) => {}; // console.log(`[MAP_DEBUG] ${msg}`);
+    const shouldLog = false;
 
     if (!civetMap) return createEmptySourceMap(svelteFile.filename);
 
@@ -107,158 +105,141 @@ export function normalize(
     const civetLines = civetContent.split('\n');
     const tsLines = tsCode.split('\n');
 
-    // Initialize a fresh mapping
     const gen = new GenMapping();
     setSourceContent(gen, civetSource, civetContent);
 
-    // Track mapped positions to avoid duplicates and for null-mapping
-    const usedGenPositions = new Map<number, Set<number>>();
     const consumedMatchCount = new Map<string, number>();
+    const lastMappedGenCol = new Map<number, number>();
 
-    // --- PASS 1: Map High-Quality Anchors ---
     const anchors = collectAnchorsFromTs(tsCode, svelteFile.filename);
-    if (shouldLog) log(`Found ${anchors.length} anchors for high-quality mapping`);
-
-    // First, sort anchors by their position and prioritize non-whitespace
     anchors.sort((a, b) => {
         if (a.start.line !== b.start.line) return a.start.line - b.start.line;
-        if (a.start.character !== b.start.character) return a.start.character - b.start.character;
-        
-        // Prioritize keywords and operators over whitespace
-        const isHighPriorityA = ['keyword', 'operator'].includes(a.kind);
-        const isHighPriorityB = ['keyword', 'operator'].includes(b.kind);
-        if (isHighPriorityA !== isHighPriorityB) return isHighPriorityA ? -1 : 1;
-        
-        // For same kind, prioritize longer tokens
-        return ((b as any).length || 0) - ((a as any).length || 0);
+        return a.start.character - b.start.character;
     });
 
     for (const anchor of anchors) {
-        // Skip whitespace-only anchors, they are handled by the null-mapping pass
         if (anchor.text.trim() === '') continue;
 
-        // Skip generated identifiers
         if (isGeneratedIdentifier(anchor.text, anchor.kind)) {
             if (shouldLog) log(`Skipping generated identifier: ${anchor.text}`);
             continue;
         }
 
         const { line: tsLine, character: tsCol } = anchor.start;
-        
-        // Find corresponding line in Civet source
+        const tsLen = anchor.text.length;
+        const tsEndCol = tsCol + tsLen;
+
         let civetLineIndex: number | undefined;
         if (typeof civetMap.mappings === 'string') {
             const decoded = decode(civetMap.mappings);
-            for (const seg of decoded[tsLine] || []) {
-                if (seg.length >= 4) {
-                    civetLineIndex = seg[2];
-                    break;
-                }
+            const lineMapping = decoded[tsLine] || [];
+            if (lineMapping.length > 0 && lineMapping[0].length >= 4) {
+                civetLineIndex = lineMapping[0][2];
             }
         } else if (Array.isArray(civetMap.lines)) {
-            for (const seg of civetMap.lines[tsLine] || []) {
-                if (seg.length >= 4) {
-                    civetLineIndex = seg[2];
-                    break;
-                }
+            const lineMapping = civetMap.lines[tsLine] || [];
+            if (lineMapping.length > 0 && lineMapping[0].length >= 4) {
+                civetLineIndex = lineMapping[0][2];
             }
         }
 
-        if (civetLineIndex === undefined) continue;
+        if (civetLineIndex === undefined) {
+            addMapping(gen, {
+                generated: { line: tsLine + 1, column: tsCol },
+                source: null as any,
+                original: null as any,
+            });
+            lastMappedGenCol.set(tsLine, tsEndCol);
+            continue;
+        }
+        
+        const origLine = civetLineIndex + civetContentStartLine - 1;
+
+        const lastCol = lastMappedGenCol.get(tsLine) ?? -1;
+        if (tsCol > lastCol + 1) {
+            // Gap before anchor: map to null so it doesn't point to Civet col 0
+            addMapping(gen, {
+                generated: { line: tsLine + 1, column: lastCol + 1 },
+                source: null as any,
+                original: null as any,
+            });
+        }
 
         const civetLineText = civetLines[civetLineIndex];
         const cacheKey = `${civetLineIndex}:${anchor.text}:${anchor.kind}`;
-        const consumedCount = consumedMatchCount.get(cacheKey) || 0;
+        const consumed = consumedMatchCount.get(cacheKey) || 0;
 
-        // Build list of search tokens (the TS text + any Civet aliases)
         const searchTokens = [anchor.text, ...(TS_TO_CIVET_ALIASES[anchor.text] ?? [])];
         let position: { startIndex: number; length: number } | undefined;
         let usedSearchText = anchor.text;
-        for (const tokenCandidate of searchTokens) {
-            position = locateTokenInCivetLine(civetLineText, tokenCandidate, anchor.kind, consumedCount);
+
+        for (const token of searchTokens) {
+            position = locateTokenInCivetLine(civetLineText, token, anchor.kind, consumed);
             if (position) {
-                usedSearchText = tokenCandidate;
+                usedSearchText = token;
                 break;
             }
         }
-        if (!position) continue;
-
-        // Update consumed count keyed by the actual search token we matched
-        const cacheKeyActual = `${civetLineIndex}:${usedSearchText}:${anchor.kind}`;
-        consumedMatchCount.set(cacheKeyActual, (consumedMatchCount.get(cacheKeyActual) || 0) + 1);
-
-        // Calculate final source positions
-        const origLine = civetLineIndex + civetContentStartLine - 1;
-        const origCol = indentLen + position.startIndex;
-
-        // Ensure we have a Set for this line's used columns
-        let usedCols = usedGenPositions.get(tsLine);
-        if (!usedCols) {
-            usedCols = new Set<number>();
-            usedGenPositions.set(tsLine, usedCols);
-        }
-
-        const tsLen = anchor.text.length;
-        const cvLen = position.length;
-
-        // Map the token's first column (start position)
-        if (!usedCols.has(tsCol)) {
-            usedCols.add(tsCol);
-            if (shouldLog) log(`Mapping token start "${anchor.text}" at TSX L${tsLine + 1}:C${tsCol} => Svelte L${origLine + 1}:C${origCol}`);
+        
+        if (!position) {
+            // Anchor text not found in Civet line: treat as generated (null mapping)
             addMapping(gen, {
                 generated: { line: tsLine + 1, column: tsCol },
-                source: civetSource,
-                original: { line: origLine + 1, column: origCol },
-                name: anchor.text
+                source: null as any,
+                original: null as any,
             });
+            lastMappedGenCol.set(tsLine, tsEndCol);
+            continue;
         }
+        
+        const actualCacheKey = `${civetLineIndex}:${usedSearchText}:${anchor.kind}`;
+        consumedMatchCount.set(actualCacheKey, (consumedMatchCount.get(actualCacheKey) || 0) + 1);
 
-        // Map the token's last column (end position)
-        const tsEndCol = tsCol + tsLen - 1;
-        const origEndCol = origCol + cvLen - 1;
-        if (!usedCols.has(tsEndCol)) {
-            usedCols.add(tsEndCol);
-            if (shouldLog) log(`Mapping token end "${anchor.text}" at TSX L${tsLine + 1}:C${tsEndCol} => Svelte L${origLine + 1}:C${origEndCol}`);
-            addMapping(gen, {
-                generated: { line: tsLine + 1, column: tsEndCol },
-                source: civetSource,
-                original: { line: origLine + 1, column: origEndCol }
-            });
-        }
+        const origCol = indentLen + position.startIndex;
 
-        // Mark all columns of the token as used
-        for (let i = 0; i < tsLen; i++) {
-            usedCols.add(tsCol + i);
-        }
+        // Map token start
+        addMapping(gen, {
+            generated: { line: tsLine + 1, column: tsCol },
+            source: civetSource,
+            original: { line: origLine + 1, column: origCol },
+            name: anchor.text,
+        });
+
+        // Map token end (inclusive) so tooling knows exact range
+        const origEndCol = origCol + position.length - 1;
+        addMapping(gen, {
+            generated: { line: tsLine + 1, column: tsEndCol - 1 },
+            source: civetSource,
+            original: { line: origLine + 1, column: origEndCol },
+            name: anchor.text
+        });
+
+        // Map the whitespace character in Civet AFTER the token to TS column 0.
+        // This provides a stable "default" mapping for any unmapped sections of the TS line.
+        const afterOrigCol = origCol + position.length;
+        addMapping(gen, {
+            generated: { line: tsLine + 1, column: 0 },
+            source: civetSource,
+            original: { line: origLine + 1, column: afterOrigCol },
+        });
+
+        lastMappedGenCol.set(tsLine, tsEndCol);
     }
-
-    // --- PASS 2: Null-Map Unmapped GENERATED positions ---
-    if (shouldLog) log('Starting Pass 2: Null-mapping unmapped GENERATED positions');
 
     for (let lineIdx = 0; lineIdx < tsLines.length; lineIdx++) {
         const lineText = tsLines[lineIdx];
-        const usedCols = usedGenPositions.get(lineIdx) || new Set<number>();
+        if (lineText.length === 0) continue;
 
-        let inUnmappedRun = false;
-        for (let col = 0; col < lineText.length; col++) {
-            if (!usedCols.has(col)) {
-                if (!inUnmappedRun) {
-                    // Start of unmapped run - emit ONE null segment
-                    if (shouldLog && lineIdx === tsLines.findIndex(l => l.includes('if (abc === query)'))) {
-                        log(`Null-mapping at TSX L${lineIdx + 1}:C${col} (char: "${lineText[col]}")`);
-                    }
-                    addMapping(gen, {
-                        generated: { line: lineIdx + 1, column: col }
-                    });
-                    inUnmappedRun = true;
-                }
-            } else {
-                inUnmappedRun = false;
-            }
+        const lastCol = lastMappedGenCol.get(lineIdx) ?? -1;
+        if (lastCol < lineText.length) {
+            // Tail gap: always null-map instead of pointing to Civet col 0
+            addMapping(gen, {
+                generated: { line: lineIdx + 1, column: lastCol + 1 },
+                source: null as any,
+                original: null as any,
+            });
         }
     }
 
-    const map = toEncodedMap(gen);
-    map.sourcesContent = [civetContent];
-    return map;
+    return toEncodedMap(gen);
 }
