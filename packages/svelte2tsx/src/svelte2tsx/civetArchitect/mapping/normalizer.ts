@@ -238,7 +238,14 @@ function buildDenseMapLines(
         const sourceSvelteStartCol = locationInfo.startIndex + indentation;
         const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
         
-        const tokenLength = locationInfo.length;
+        let tokenLength = locationInfo.length;
+        // Special-case for synthetic "unless" keyword: include a following space if present
+        if (anchor.text === 'unless') {
+          const nextChar = civetLineText[locationInfo.startIndex + tokenLength];
+          if (nextChar === ' ') {
+            tokenLength += 1;
+          }
+        }
         const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength;
 
         // Point 2: Add an edge mapping at the column right after the token (unique per token).
