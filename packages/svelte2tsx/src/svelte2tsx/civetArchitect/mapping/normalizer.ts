@@ -14,7 +14,6 @@ const operatorRegexCache   = new Map<string, RegExp>();
 function locateTokenInCivetLine(
   anchor: Anchor,
   civetLineText: string,
-  consumedCount: number,
   operatorLookup: Record<string, string>,
   debug: boolean,
   searchFrom = 0
@@ -36,7 +35,7 @@ function locateTokenInCivetLine(
   let foundIndex = -1;
 
   if (debug) {
-    console.log(`[BUG_HUNT] Searching for "${searchText}" (anchor: "${anchor.text}", kind: ${anchor.kind}). Consumed: ${consumedCount}. Line content: "${civetLineText}"`);
+    console.log(`[BUG_HUNT] Searching for "${searchText}" (anchor: "${anchor.text}", kind: ${anchor.kind}). Line content: "${civetLineText}"`);
   }
 
   const treatAsOperator = anchor.kind === 'operator' || keywordOverride !== undefined;
@@ -49,18 +48,11 @@ function locateTokenInCivetLine(
       searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
       identifierRegexCache.set(searchText, searchRegex);
     }
-    searchRegex.lastIndex = searchFrom;
+    searchRegex.lastIndex = searchFrom; 
 
-    for (let j = 0; j <= consumedCount; j++) {
-      const match = searchRegex.exec(civetLineText);
-      if (debug) {
-        console.log(`[FIX_VERIFY_ITER] j=${j}: Match result: ${match ? `found at index ${match.index}` : 'null'}`);
-      }
-      if (!match) {
-        foundIndex = -1;
-        break;
-      }
-      foundIndex = match.index;
+    const match = searchRegex.exec(civetLineText);
+    if (match) {
+        foundIndex = match.index;
     }
   } else if (treatAsOperator) {
     if (debug) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
@@ -74,31 +66,17 @@ function locateTokenInCivetLine(
             operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
             operatorRegexCache.set(trimmedText, operatorRegex);
         }
-    let searchOffset = searchFrom;
-    for (let j = 0; j <= consumedCount; j++) {
-      operatorRegex.lastIndex = searchOffset;
+      operatorRegex.lastIndex = searchFrom;
       const match = operatorRegex.exec(civetLineText);
-      if (!match) {
-        foundIndex = -1;
-        break;
+      if (match) {
+        const fullMatch = match[0];
+        const leadingSpace = fullMatch.match(/^\s*/)[0].length;
+        foundIndex = match.index + leadingSpace;
       }
-      const fullMatch = match[0];
-      const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-      foundIndex = match.index + leadingSpace;
-      searchOffset = match.index + fullMatch.length;
-        }
     }
   } else {
     if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
-    let searchOffset = searchFrom;
-    for (let j = 0; j <= consumedCount; j++) {
-      foundIndex = civetLineText.indexOf(searchText, searchOffset);
-      if (debug) {
-          console.log(`[BUG_HUNT_ITER] j=${j}: searchOffset=${searchOffset}, foundIndex=${foundIndex}`);
-      }
-      if (foundIndex === -1) break;
-      searchOffset = foundIndex + searchText.length;
-    }
+    foundIndex = civetLineText.indexOf(searchText, searchFrom);
   }
 
   if (debug) {
@@ -212,7 +190,7 @@ function buildDenseMapLines(
       
       while (true) {
         const searchFrom = nextSearchIndexCache.get(cacheKey) ?? 0;
-        locationInfo = locateTokenInCivetLine(anchor, civetLineText, 0, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
+        locationInfo = locateTokenInCivetLine(anchor, civetLineText, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
 
         if (locationInfo === undefined) {
           break; // no further occurrence found
