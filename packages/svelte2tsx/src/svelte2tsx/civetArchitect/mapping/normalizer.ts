@@ -71,7 +71,11 @@ function locateTokenInCivetLine(
       if (match) {
         const fullMatch = match[0];
         const leadingSpace = fullMatch.match(/^\s*/)[0].length;
+        const trailingSpace = fullMatch.length - leadingSpace - trimmedText.length;
         foundIndex = match.index + leadingSpace;
+        // Adjust length to include trailing whitespace so that the next token does not claim it.
+        const lengthIncludingTrailing = trimmedText.length + trailingSpace;
+        return { startIndex: foundIndex, length: lengthIncludingTrailing };
       }
     }
   } else {
@@ -87,7 +91,8 @@ function locateTokenInCivetLine(
     return undefined;
   }
 
-  const matchLength = treatAsOperator ? searchText.trim().length : searchText.length;
+  // Note: for treatAsOperator we already returned from inside the branch when matched.
+  const matchLength = searchText.length;
   return { startIndex: foundIndex, length: matchLength };
 }
 
@@ -238,19 +243,17 @@ function buildDenseMapLines(
         const sourceSvelteStartCol = locationInfo.startIndex + indentation;
         const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
         
-        let tokenLength = locationInfo.length;
-        // Special-case for synthetic "unless" keyword: include a following space if present
-        if (anchor.text === 'unless') {
-          const nextChar = civetLineText[locationInfo.startIndex + tokenLength];
-          if (nextChar === ' ') {
-            tokenLength += 1;
-          }
-        }
+        const tokenLength = locationInfo.length;
         const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength;
 
         // Point 2: Add an edge mapping at the column right after the token (unique per token).
-        const genEdgeCol = anchor.end.character; // first char AFTER the token
-        lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+        // Skip this if the last mapped character is whitespace to avoid
+        // accidentally mapping the first character of the next Civet token twice.
+        const lastMappedChar = civetLineText[locationInfo.startIndex + tokenLength - 1];
+        const genEdgeCol = anchor.end.character; // first char AFTER the token in TS
+        if (!(lastMappedChar === ' ' || lastMappedChar === '\t')) {
+          lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+        }
 
         // Point 1: Map token start
         const startSegment: number[] = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
@@ -352,8 +355,8 @@ export function normalizeCivetMap(
     // rest of the normalization logic.
     'let': '.=',
     'const': ':=',
-    'function': '->'
-    // Extend as needed
+    'function': '->',
+    'unless': 'unless'
   };
 
   // Phase 1: Collect identifier anchors *and* import string-literal anchors from TS AST.
