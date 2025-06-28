@@ -194,16 +194,22 @@ function buildDenseMapLines(
         if (nameIdx > -1) startSegment.push(nameIdx);
         lineSegments.push(startSegment);
         
-        // Point 1: Map token end (inclusive) to ensure full token coverage
-        const endSegment: number[] = [anchor.end.character - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive - 1];
-        if (nameIdx > -1) endSegment.push(nameIdx);
-        lineSegments.push(endSegment);
+        let endSegment: number[] | undefined;
+        // Point 1: Map token end (inclusive) to ensure full token coverage, but
+        // only if the token spans more than one character. For single-character
+        // tokens (like '=' or ';') the start and end columns are identical and
+        // emitting both would create a duplicate segment.
+        if (tokenLength > 1) {
+          endSegment = [anchor.end.character - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive - 1];
+          if (nameIdx > -1) endSegment.push(nameIdx);
+          lineSegments.push(endSegment);
+        }
 
         if (DEBUG_TOKEN && anchor.text === 'abc') {
             console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
             console.log(`- TS Start: ${anchor.start.character}, End: ${anchor.end.character}`);
             console.log(`- Svelte Start: ${sourceSvelteStartCol}, End: ${sourceSvelteEndColExclusive}`);
-            console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment, [genEdgeCol]])}\n`);
+            console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment ?? [], [genEdgeCol]])}\n`);
         }
       } else {
         // Could not find in original line, treat as generated.

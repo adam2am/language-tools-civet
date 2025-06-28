@@ -78,7 +78,7 @@ export function collectAnchorsFromTs(
             tsAnchors.push({ text: kwText, start, end, kind: 'keyword' });
         }
 
-        node.getChildren(tsSourceFile).forEach(findAnchors);
+        ts.forEachChild(node, findAnchors);
     }
     findAnchors(tsSourceFile);
     return tsAnchors;
