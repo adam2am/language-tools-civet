@@ -136,7 +136,8 @@ ${tsCode}`);
       // --- Rewrite the Svelte file content ---
       const indentString = indentStr;
       const trimmedCompiledTsCode = tsCode.replace(/\r?\n+$/g, '');
-      const reindentedTsCode = '\n' + trimmedCompiledTsCode.split('\n').map(line => `${indentString}${line}`).join('\n') + '\n';
+      const tsCodeLines = trimmedCompiledTsCode.split('\n');
+      const reindentedTsCode = '\n' + tsCodeLines.map(line => `${indentString}${line}`).join('\n') + '\n';
       
       const langAttrLengthChange = (langValueStart !== -1) ? ('ts'.length - (langValueEnd - langValueStart)) : 0;
       const contentLengthChange = reindentedTsCode.length - (end - start);
@@ -154,8 +155,9 @@ ${tsCode}`);
       // The TS code content starts after the lang attribute has potentially changed length.
       const tsCodeStartInOutput = blockStartInOutput + langAttrLengthChange;
 
-      const civetLineCount = svelteCode.slice(start, end).split('\n').length;
-      const tsLineCount = reindentedTsCode.split('\n').length;
+      const civetBlockContent = svelteCode.slice(start, end);
+      const civetLineCount = civetBlockContent.split('\n').length;
+      const tsLineCount = tsCodeLines.length;
 
       // Build per-line indent table (uniform for now but future-proof)
       // const removedIndentPerLine = Array.from({ length: tsLineCount }, () => indentLen); <-- REMOVED: This is redundant as mapChainer falls back to commonLength.
@@ -221,7 +223,11 @@ ${tsCode}`);
             const absoluteColumn = indentStr.length + relCol - 1;    // convert relCol (1-based) to 0-based within full Svelte file
 
             const width = 4; // highlight up to four characters for visibility
-            const lineText = svelteCode.split(/\r?\n/)[absoluteLine - 1] || '';
+            
+            // Efficiently get the line's text without splitting the whole file
+            const lineStartOffset = svelteCode.lastIndexOf('\n', tag.content.start + err.offset) + 1;
+            const lineEndOffset = svelteCode.indexOf('\n', lineStartOffset);
+            const lineText = svelteCode.substring(lineStartOffset, lineEndOffset > -1 ? lineEndOffset : undefined);
 
             let highlightStart = absoluteColumn;
             let highlightEnd   = Math.min(absoluteColumn + width, lineText.length);
