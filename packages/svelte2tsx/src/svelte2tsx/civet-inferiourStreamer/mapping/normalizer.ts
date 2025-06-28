@@ -20,7 +20,7 @@ function locateTokenInCivetLine(
     console.log(`[BUG_HUNT] Searching for "${searchText}" (anchor: "${anchor.text}", kind: ${anchor.kind}). Consumed: ${consumedCount}. Line content: "${civetLineText}"`);
   }
 
-  if (anchor.kind === 'identifier') {
+  if (anchor.kind === 'identifier' || (anchor.kind as string) === 'keyword') {
     if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier.`);
     const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
@@ -39,19 +39,25 @@ function locateTokenInCivetLine(
     }
   } else if (anchor.kind === 'operator') {
     if (debug) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
-    const operatorRegex = new RegExp(`\\s*${searchText.trim()}\\s*`, 'g');
-    let searchOffset = 0;
-    for (let j = 0; j <= consumedCount; j++) {
-      operatorRegex.lastIndex = searchOffset;
-      const match = operatorRegex.exec(civetLineText);
-      if (!match) {
+    const trimmedText = searchText.trim();
+    if (!trimmedText) {
         foundIndex = -1;
-        break;
-      }
-      const fullMatch = match[0];
-      const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-      foundIndex = match.index + leadingSpace;
-      searchOffset = match.index + fullMatch.length;
+    } else {
+        const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
+        let searchOffset = 0;
+        for (let j = 0; j <= consumedCount; j++) {
+            operatorRegex.lastIndex = searchOffset;
+            const match = operatorRegex.exec(civetLineText);
+            if (!match) {
+                foundIndex = -1;
+                break;
+            }
+            const fullMatch = match[0];
+            const leadingSpace = fullMatch.match(/^\s*/)[0].length;
+            foundIndex = match.index + leadingSpace;
+            searchOffset = match.index + fullMatch.length;
+        }
     }
   } else {
     if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
@@ -244,6 +250,7 @@ export function normalizeCivetMap(
   // Map TS operator tokens to their Civet equivalents. Defined up-front so the
   // AST walker and later search logic can reference it safely.
   const operatorLookup: Record<string, string> = {
+    '=': '=',
     '===': ' is ',
     '!==': ' isnt ',
     '&&':  ' and ',

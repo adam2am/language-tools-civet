@@ -3,11 +3,13 @@ import * as ts from 'typescript';
 // avoid unused-import linter errors
 if (ts) { /* noop */ }
 
+export type AnchorKind = 'identifier' | 'stringLiteral' | 'numericLiteral' | 'operator' | 'keyword';
+
 export interface Anchor {
     text: string;
     start: ts.LineAndCharacter;
     end: ts.LineAndCharacter;
-    kind: 'identifier' | 'stringLiteral' | 'numericLiteral' | 'operator';
+    kind: AnchorKind;
 }
 
 export function collectAnchorsFromTs(
@@ -16,12 +18,18 @@ export function collectAnchorsFromTs(
     OPERATOR_MAP: Record<string, string>
 ): Anchor[] {
     const tsAnchors: Anchor[] = [];
+    // Reference to avoid unused parameter lint errors
+    void OPERATOR_MAP;
     const tsSourceFile = ts.createSourceFile(
         `${svelteFilePath}-snippet.ts`,
         tsCode,
         ts.ScriptTarget.ESNext,
         true
     );
+
+    function isKeywordKind(kind: ts.SyntaxKind): boolean {
+        return kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
+    }
 
     function findAnchors(node: ts.Node) {
         if (ts.isIdentifier(node)) {
@@ -51,15 +59,23 @@ export function collectAnchorsFromTs(
             tsAnchors.push({ text: numText, start, end, kind: 'numericLiteral' });
         }
 
-        // Operators and Punctuation
+        // Operators (punctuation) we know how to map
         if (ts.isToken(node) && node.kind >= ts.SyntaxKind.FirstPunctuation && node.kind <= ts.SyntaxKind.LastPunctuation) {
             const operatorText = node.getText(tsSourceFile);
-            // Only collect operators we know how to map back to Civet text
-            if (OPERATOR_MAP.hasOwnProperty(operatorText)) {
+            // Skip empty strings (can happen for some placeholder tokens)
+            if (operatorText.trim()) {
                 const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
                 const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
                 tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
             }
+        }
+
+        // Keywords like if/else/for
+        if (ts.isToken(node) && isKeywordKind(node.kind)) {
+            const kwText = node.getText(tsSourceFile);
+            const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
+            const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
+            tsAnchors.push({ text: kwText, start, end, kind: 'keyword' });
         }
 
         node.getChildren(tsSourceFile).forEach(findAnchors);
