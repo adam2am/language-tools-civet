@@ -27,9 +27,38 @@ export function collectAnchorsFromTs(
         true
     );
 
-    function isKeywordKind(kind: ts.SyntaxKind): boolean {
-        return kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
+    // ---------------------------------------------------------------------
+    // Pass 1: Fast scanner for keywords & punctuation (operators)
+    // ---------------------------------------------------------------------
+    const scanner = ts.createScanner(ts.ScriptTarget.ESNext, /*skipTrivia*/ true, ts.LanguageVariant.Standard, tsCode);
+    while (true) {
+        const kind = scanner.scan();
+        if (kind === ts.SyntaxKind.EndOfFileToken) break;
+
+        const isKeyword = kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
+        const isPunctuation = kind >= ts.SyntaxKind.FirstPunctuation && kind <= ts.SyntaxKind.LastPunctuation;
+
+        if (!isKeyword && !isPunctuation) continue;
+
+        const tokenText = scanner.getTokenText();
+        if (!tokenText.trim()) continue; // ignore trivia-like empties
+
+        const startPos = scanner.getTokenPos();
+        const endPos = scanner.getTextPos(); // exclusive end
+        const start = tsSourceFile.getLineAndCharacterOfPosition(startPos);
+        const end = tsSourceFile.getLineAndCharacterOfPosition(endPos);
+
+        tsAnchors.push({
+            text: tokenText,
+            start,
+            end,
+            kind: isKeyword ? 'keyword' : 'operator'
+        });
     }
+
+    // function isKeywordKind(kind: ts.SyntaxKind): boolean {
+    //     return kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
+    // }
 
     function findAnchors(node: ts.Node) {
         if (ts.isIdentifier(node)) {
@@ -59,26 +88,7 @@ export function collectAnchorsFromTs(
             tsAnchors.push({ text: numText, start, end, kind: 'numericLiteral' });
         }
 
-        // Operators (punctuation) we know how to map
-        if (ts.isToken(node) && node.kind >= ts.SyntaxKind.FirstPunctuation && node.kind <= ts.SyntaxKind.LastPunctuation) {
-            const operatorText = node.getText(tsSourceFile);
-            // Skip empty strings (can happen for some placeholder tokens)
-            if (operatorText.trim()) {
-                const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
-                const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
-                tsAnchors.push({ text: operatorText, start, end, kind: 'operator' });
-            }
-        }
-
-        // Keywords like if/else/for
-        if (ts.isToken(node) && isKeywordKind(node.kind)) {
-            const kwText = node.getText(tsSourceFile);
-            const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
-            const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
-            tsAnchors.push({ text: kwText, start, end, kind: 'keyword' });
-        }
-
-        ts.forEachChild(node, findAnchors);
+        node.getChildren(tsSourceFile).forEach(findAnchors);
     }
     findAnchors(tsSourceFile);
     return tsAnchors;
