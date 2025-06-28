@@ -16,7 +16,8 @@ function locateTokenInCivetLine(
   civetLineText: string,
   consumedCount: number,
   operatorLookup: Record<string, string>,
-  debug: boolean
+  debug: boolean,
+  searchFrom = 0
 ): { startIndex: number; length: number } | undefined {
   // Hybrid override: If the token is a TS keyword that has a Civet alias in
   // `operatorLookup`, we want to search for that alias (".=" / ":=" / "->")
@@ -48,7 +49,7 @@ function locateTokenInCivetLine(
       searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
       identifierRegexCache.set(searchText, searchRegex);
     }
-    searchRegex.lastIndex = 0; // reset for predictable iteration
+    searchRegex.lastIndex = searchFrom;
 
     for (let j = 0; j <= consumedCount; j++) {
       const match = searchRegex.exec(civetLineText);
@@ -73,7 +74,7 @@ function locateTokenInCivetLine(
             operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
             operatorRegexCache.set(trimmedText, operatorRegex);
         }
-    let searchOffset = 0;
+    let searchOffset = searchFrom;
     for (let j = 0; j <= consumedCount; j++) {
       operatorRegex.lastIndex = searchOffset;
       const match = operatorRegex.exec(civetLineText);
@@ -89,7 +90,7 @@ function locateTokenInCivetLine(
     }
   } else {
     if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
-    let searchOffset = 0;
+    let searchOffset = searchFrom;
     for (let j = 0; j <= consumedCount; j++) {
       foundIndex = civetLineText.indexOf(searchText, searchOffset);
       if (debug) {
@@ -171,7 +172,7 @@ function buildDenseMapLines(
   DEBUG_TOKEN: boolean
 ) {
   const decoded: number[][][] = [];
-  const consumedMatchCount = new Map<string, number>();
+  const nextSearchIndexCache = new Map<string, number>();
   const claimedRangesByLine = new Map<number, { start: number; end: number }[]>();
 
   for (let i = 0; i < tsLines.length; i++) {
@@ -207,24 +208,30 @@ function buildDenseMapLines(
           ? operatorLookup[anchor.text]
           : anchor.text;
       const cacheKey = `${civetLineIndex}:${searchText}`;
-      let consumedCount = consumedMatchCount.get(cacheKey) || 0;
       let locationInfo;
+      
       while (true) {
-        locationInfo = locateTokenInCivetLine(anchor, civetLineText, consumedCount, operatorLookup, DEBUG_DENSE_MAP);
+        const searchFrom = nextSearchIndexCache.get(cacheKey) ?? 0;
+        locationInfo = locateTokenInCivetLine(anchor, civetLineText, 0, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
+
         if (locationInfo === undefined) {
-          break;
+          break; // no further occurrence found
         }
+
         const newStart = locationInfo.startIndex;
         const newEndExclusive = newStart + locationInfo.length;
+        
+        nextSearchIndexCache.set(cacheKey, newEndExclusive);
+
         const existingRanges = claimedRangesByLine.get(civetLineIndex) || [];
         const overlaps = existingRanges.some(r => newStart < r.end && newEndExclusive > r.start);
+        
         if (!overlaps) {
+          // Reserve this range and exit loop
           existingRanges.push({ start: newStart, end: newEndExclusive });
           claimedRangesByLine.set(civetLineIndex, existingRanges);
-          consumedMatchCount.set(cacheKey, consumedCount + 1);
           break;
         }
-        consumedCount++;
       }
 
       if (locationInfo !== undefined) {
