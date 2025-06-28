@@ -1,10 +1,7 @@
 // import { GenMapping, setSourceContent, addMapping, toEncodedMap } from '@jridgewell/gen-mapping';
 import type { EncodedSourceMap } from '@jridgewell/gen-mapping';
 import type { LinesMap } from '../types';
-import * as ts from 'typescript';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
-// avoid unused-import linter errors
-if (ts) { /* noop */ }
 
 // ---------------------------------------------------------------------------
 //  SIMPLE REGEX CACHE  (perf optimisation #2)
@@ -21,18 +18,33 @@ function locateTokenInCivetLine(
   operatorLookup: Record<string, string>,
   debug: boolean
 ): { startIndex: number; length: number } | undefined {
-  const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
+  // Hybrid override: If the token is a TS keyword that has a Civet alias in
+  // `operatorLookup`, we want to search for that alias (".=" / ":=" / "->")
+  // and treat the search behaviour like an operator rather than a word.
+
+  const keywordOverride = (anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined
+      ? operatorLookup[anchor.text]
+      : undefined;
+
+  const searchText = anchor.kind === 'operator'
+    ? (operatorLookup[anchor.text] || anchor.text)
+    : ((anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined)
+      ? operatorLookup[anchor.text]
+      : anchor.text;
+
   let foundIndex = -1;
 
   if (debug) {
     console.log(`[BUG_HUNT] Searching for "${searchText}" (anchor: "${anchor.text}", kind: ${anchor.kind}). Consumed: ${consumedCount}. Line content: "${civetLineText}"`);
   }
 
-  if (anchor.kind === 'identifier' || (anchor.kind as string) === 'keyword') {
+  const treatAsOperator = anchor.kind === 'operator' || keywordOverride !== undefined;
+
+  if (anchor.kind === 'identifier' || ((anchor.kind as string) === 'keyword' && !treatAsOperator)) {
     if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier.`);
     let searchRegex = identifierRegexCache.get(searchText);
     if (!searchRegex) {
-      const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
       identifierRegexCache.set(searchText, searchRegex);
     }
@@ -49,7 +61,7 @@ function locateTokenInCivetLine(
       }
       foundIndex = match.index;
     }
-  } else if (anchor.kind === 'operator') {
+  } else if (treatAsOperator) {
     if (debug) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
     const trimmedText = searchText.trim();
     if (!trimmedText) {
@@ -61,18 +73,18 @@ function locateTokenInCivetLine(
             operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
             operatorRegexCache.set(trimmedText, operatorRegex);
         }
-        let searchOffset = 0;
-        for (let j = 0; j <= consumedCount; j++) {
-          operatorRegex.lastIndex = searchOffset;
-          const match = operatorRegex.exec(civetLineText);
-          if (!match) {
-            foundIndex = -1;
-            break;
-          }
-          const fullMatch = match[0];
-          const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-          foundIndex = match.index + leadingSpace;
-          searchOffset = match.index + fullMatch.length;
+    let searchOffset = 0;
+    for (let j = 0; j <= consumedCount; j++) {
+      operatorRegex.lastIndex = searchOffset;
+      const match = operatorRegex.exec(civetLineText);
+      if (!match) {
+        foundIndex = -1;
+        break;
+      }
+      const fullMatch = match[0];
+      const leadingSpace = fullMatch.match(/^\s*/)[0].length;
+      foundIndex = match.index + leadingSpace;
+      searchOffset = match.index + fullMatch.length;
         }
     }
   } else {
@@ -91,12 +103,12 @@ function locateTokenInCivetLine(
   if (debug) {
     console.log(`[BUG_HUNT_RESULT] Final foundIndex for "${searchText}" is ${foundIndex}`);
   }
-  
+
   if (foundIndex === -1) {
     return undefined;
   }
 
-  const matchLength = anchor.kind === 'operator' ? searchText.trim().length : searchText.length;
+  const matchLength = treatAsOperator ? searchText.trim().length : searchText.length;
   return { startIndex: foundIndex, length: matchLength };
 }
 
@@ -160,13 +172,17 @@ function buildDenseMapLines(
 ) {
   const decoded: number[][][] = [];
   const consumedMatchCount = new Map<string, number>();
+  const claimedRangesByLine = new Map<number, { start: number; end: number }[]>();
 
   for (let i = 0; i < tsLines.length; i++) {
     const lineAnchors = anchorsByLine.get(i) || [];
     const lineSegments: number[][] = [];
     let lastGenCol = 0;
 
-    for (const anchor of lineAnchors) {
+    for (let aIdx = 0; aIdx < lineAnchors.length; aIdx++) {
+      const anchor = lineAnchors[aIdx];
+      const nextAnchorStart = aIdx + 1 < lineAnchors.length ? lineAnchors[aIdx + 1].start.character : undefined;
+
       // --- Fill gap before this token with a null mapping ---
       if (anchor.start.character > lastGenCol) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol} -> ${anchor.start.character}`);
@@ -186,14 +202,33 @@ function buildDenseMapLines(
 
       // It's not a known generated token, so try to find its original position.
       const civetLineText = civetCodeLines[civetLineIndex] || '';
-      const searchText = anchor.kind === 'operator' ? (operatorLookup[anchor.text] || anchor.text) : anchor.text;
+      const searchText = anchor.kind === 'operator'
+        ? (operatorLookup[anchor.text] || anchor.text)
+        : ((anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined)
+          ? operatorLookup[anchor.text]
+          : anchor.text;
       const cacheKey = `${civetLineIndex}:${searchText}`;
-      const consumedCount = consumedMatchCount.get(cacheKey) || 0;
-      
-      const locationInfo = locateTokenInCivetLine(anchor, civetLineText, consumedCount, operatorLookup, DEBUG_DENSE_MAP);
+      let consumedCount = consumedMatchCount.get(cacheKey) || 0;
+      let locationInfo;
+      while (true) {
+        locationInfo = locateTokenInCivetLine(anchor, civetLineText, consumedCount, operatorLookup, DEBUG_DENSE_MAP);
+        if (locationInfo === undefined) {
+          break;
+        }
+        const newStart = locationInfo.startIndex;
+        const newEndExclusive = newStart + locationInfo.length;
+        const existingRanges = claimedRangesByLine.get(civetLineIndex) || [];
+        const overlaps = existingRanges.some(r => newStart < r.end && newEndExclusive > r.start);
+        if (!overlaps) {
+          existingRanges.push({ start: newStart, end: newEndExclusive });
+          claimedRangesByLine.set(civetLineIndex, existingRanges);
+          consumedMatchCount.set(cacheKey, consumedCount + 1);
+          break;
+        }
+        consumedCount++;
+      }
 
       if (locationInfo !== undefined) {
-        consumedMatchCount.set(cacheKey, consumedCount + 1);
         const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
         const sourceSvelteStartCol = locationInfo.startIndex + indentation;
         const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
@@ -203,7 +238,10 @@ function buildDenseMapLines(
 
         // Point 2: Add an edge mapping at the column right after the token (unique per token).
         const genEdgeCol = anchor.end.character; // first char AFTER the token
-        lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+        if (nextAnchorStart !== genEdgeCol) {
+          // Only add edge mapping if it doesn't collide with the start of the next token.
+          lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+        }
 
         // Point 1: Map token start
         const startSegment: number[] = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
@@ -217,8 +255,8 @@ function buildDenseMapLines(
         // emitting both would create a duplicate segment.
         if (tokenLength > 1) {
           endSegment = [anchor.end.character - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive - 1];
-          if (nameIdx > -1) endSegment.push(nameIdx);
-          lineSegments.push(endSegment);
+        if (nameIdx > -1) endSegment.push(nameIdx);
+        lineSegments.push(endSegment);
         }
 
         if (DEBUG_TOKEN && anchor.text === 'abc') {
@@ -242,8 +280,18 @@ function buildDenseMapLines(
       lineSegments.push([lastGenCol]);
     }
 
-    const finalLineSegments = lineSegments.sort((a,b) => a[0] - b[0]);
-    decoded.push(finalLineSegments);
+    // Sort by generated column and deduplicate identical segments (same genCol & mapping)
+    const sorted = lineSegments.sort((a, b) => a[0] - b[0]);
+    const deduped: number[][] = [];
+    const seen = new Set<string>();
+    for (const seg of sorted) {
+      const key = seg.join(',');
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(seg);
+    }
+    }
+    decoded.push(deduped);
   }
   return decoded;
 }
@@ -282,7 +330,19 @@ export function normalizeCivetMap(
     '!==': ' isnt ',
     '&&':  ' and ',
     '||':  ' or ',
-    '!':   'not '
+    '!':   'not ',
+    // --- Keyword override entries (Hybrid strategy) -------------------------
+    // These map TS keywords back to their Civet equivalents so that the
+    // normalizer can treat them like "pseudo-operators" when looking up the
+    // original source location.
+    //   let       -> .=
+    //   const     -> :=
+    //   function  -> ->
+    // New keyword-operator aliases can be added here without touching the
+    // rest of the normalization logic.
+    'let': '.=',
+    'const': ':=',
+    'function': '->'
     // Extend as needed
   };
 

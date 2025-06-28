@@ -1,8 +1,5 @@
 import * as ts from 'typescript';
 
-// avoid unused-import linter errors
-if (ts) { /* noop */ }
-
 export type AnchorKind = 'identifier' | 'stringLiteral' | 'numericLiteral' | 'operator' | 'keyword';
 
 export interface Anchor {
@@ -55,10 +52,6 @@ export function collectAnchorsFromTs(
             kind: isKeyword ? 'keyword' : 'operator'
         });
     }
-
-    // function isKeywordKind(kind: ts.SyntaxKind): boolean {
-    //     return kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
-    // }
 
     function findAnchors(node: ts.Node) {
         if (ts.isIdentifier(node)) {
