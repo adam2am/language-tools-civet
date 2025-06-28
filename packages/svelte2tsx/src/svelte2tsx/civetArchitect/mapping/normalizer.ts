@@ -159,8 +159,29 @@ function buildDenseMapLines(
     let lastGenCol = 0;
 
     for (let aIdx = 0; aIdx < lineAnchors.length; aIdx++) {
-      const anchor = lineAnchors[aIdx];
+      let anchor = lineAnchors[aIdx];
+      let searchTextOverride: string | undefined;
+      let consumedAnchors = 0;
 
+      // --- Lookahead for `unless` pattern: `if (!` ---
+      if (anchor.kind === 'keyword' && anchor.text === 'if') {
+        const nextAnchor = lineAnchors[aIdx + 1];
+        const afterNextAnchor = lineAnchors[aIdx + 2];
+
+        // Check for the `if (...)` part
+        if (nextAnchor?.text === '(' && afterNextAnchor?.text === '!') {
+            // It's an `if (!` sequence. Treat it as a single `unless` keyword.
+            searchTextOverride = 'unless';
+            // Create a new synthetic anchor that spans from the start of `if` to the end of `!`
+            anchor = {
+                ...anchor,
+                end: afterNextAnchor.end,
+                text: 'unless' // For debugging and clarity
+            };
+            consumedAnchors = 2; // We are consuming the `(` and `!` anchors now
+        }
+      }
+      
       // --- Fill gap before this token with a null mapping ---
       if (anchor.start.character > lastGenCol) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol} -> ${anchor.start.character}`);
@@ -180,11 +201,11 @@ function buildDenseMapLines(
 
       // It's not a known generated token, so try to find its original position.
       const civetLineText = civetCodeLines[civetLineIndex] || '';
-      const searchText = anchor.kind === 'operator'
+      const searchText = searchTextOverride ?? (anchor.kind === 'operator'
         ? (operatorLookup[anchor.text] || anchor.text)
         : ((anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined)
           ? operatorLookup[anchor.text]
-          : anchor.text;
+          : anchor.text);
       const cacheKey = `${civetLineIndex}:${searchText}`;
       let locationInfo;
       
@@ -253,6 +274,7 @@ function buildDenseMapLines(
       }
 
       lastGenCol = anchor.end.character;
+      aIdx += consumedAnchors; // Advance index to skip processed anchors
     }
 
     // --- Fill final gap from last token to end of line ---
