@@ -157,7 +157,7 @@ ${tsCode}`);
 
       const civetBlockContent = svelteCode.slice(start, end);
       const civetLineCount = civetBlockContent.split('\n').length;
-      const tsLineCount = tsCodeLines.length;
+      const tsLineCount = reindentedTsCode.split('\n').length;
 
       // Build per-line indent table (uniform for now but future-proof)
       // const removedIndentPerLine = Array.from({ length: tsLineCount }, () => indentLen); <-- REMOVED: This is redundant as mapChainer falls back to commonLength.
