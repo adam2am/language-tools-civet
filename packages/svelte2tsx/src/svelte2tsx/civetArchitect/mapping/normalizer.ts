@@ -246,12 +246,13 @@ function buildDenseMapLines(
         const tokenLength = locationInfo.length;
         const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength;
 
-        // Point 2: Add an edge mapping at the column right after the token (unique per token).
-        // Skip this if the last mapped character is whitespace to avoid
-        // accidentally mapping the first character of the next Civet token twice.
+        // Add an edge mapping only for identifiers (multi-char) or multi-char tokens.
         const lastMappedChar = civetLineText[locationInfo.startIndex + tokenLength - 1];
         const genEdgeCol = anchor.end.character; // first char AFTER the token in TS
-        if (!(lastMappedChar === ' ' || lastMappedChar === '\t')) {
+        if (
+          (anchor.kind === 'identifier' || tokenLength > 1) &&
+          !(lastMappedChar === ' ' || lastMappedChar === '\t')
+        ) {
           lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
         }
 
