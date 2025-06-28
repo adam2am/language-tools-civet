@@ -4,7 +4,7 @@ export function mapScriptSegments(
     codeSegs: { segment: number[]; charOffset: number; blockIndex: number }[],
     blocks: any[], // Use a more specific type if available
     tracers: TraceMap[],
-    blockNameMaps: (Map<number, number> | undefined)[],
+    nameOffsets: number[],
     chainCivetDebug: boolean
 ): number[][] {
     const codeLines: number[][] = [];
@@ -12,7 +12,6 @@ export function mapScriptSegments(
         const [generatedCol, , preprocessedLine, preprocessedCol] = segment;
         const block = blocks[blockIndex];
         const tracer = tracers[blockIndex];
-        const nameMap = blockNameMaps[blockIndex];
         // Calculate relative line/col *within the compiled TS snippet* that block.map refers to.
         // preprocessedLine is 0-based line in the svelteWithTs content (where the <script> tag content starts)
         // block.tsSnippet.startLine is 1-based line where the <script> tag content starts in svelteWithTs
@@ -74,10 +73,10 @@ export function mapScriptSegments(
             if (chainCivetDebug) console.log(`[CHAINER_BACKTRACK_SUCCESS] L${tracerLine}C${tracerCol} succeeded by backtracking to C${backtrackCol}.`);
             const deltaCol = tracerCol - backtrackCol;
             const adjustedOrigCol = tracedPrev[3] + deltaCol;
-            let finalNameIndex: number | undefined = tracedPrev.length > 4 ? tracedPrev[4] : undefined;
-            if (finalNameIndex !== undefined && nameMap) {
-                finalNameIndex = nameMap.get(finalNameIndex);
-            }
+            const civetNameIndex = tracedPrev[4];
+            const finalNameIndex = (civetNameIndex !== undefined && civetNameIndex !== null)
+                ? nameOffsets[blockIndex] + civetNameIndex
+                : undefined;
             codeLines.push([generatedCol, 0, tracedPrev[2], adjustedOrigCol, finalNameIndex].filter(n => n !== undefined) as number[]);
           } else {
             // Still no luck – propagate null mapping instead of incorrect fallback
@@ -86,10 +85,10 @@ export function mapScriptSegments(
           }
         } else {
           // Normal successful trace path
-          let finalNameIndex: number | undefined = traced.length > 4 ? traced[4] : undefined;
-          if (finalNameIndex !== undefined && nameMap) {
-              finalNameIndex = nameMap.get(finalNameIndex);
-          }
+          const civetNameIndex = traced[4];
+          const finalNameIndex = (civetNameIndex !== undefined && civetNameIndex !== null)
+              ? nameOffsets[blockIndex] + civetNameIndex
+              : undefined;
           codeLines.push([generatedCol, 0, traced[2], traced[3], finalNameIndex].filter(n => n !== undefined) as number[]);
           if (chainCivetDebug) console.log(`[CHAIN_MAPS]   Traced OK. Final segment: [${generatedCol}, 0, ${traced[2]}, ${traced[3]}${finalNameIndex !== undefined ? ', '+finalNameIndex : ''}]`);
         }

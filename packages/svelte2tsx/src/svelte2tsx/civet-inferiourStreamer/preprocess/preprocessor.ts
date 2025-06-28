@@ -2,7 +2,7 @@ import MagicString from 'magic-string';
 import { parseHtmlx as parseHtmlxOriginal } from '../../../utils/htmlxparser';
 import { parse as svelteParse } from 'svelte/compiler';
 import { compileCivet } from '../compile/compiler';
-import { normalize } from '../mapping/normalizer';
+import { normalizeCivetMap } from '../mapping/normalizer';
 import { getAttributeValue, getActualContentStartLine } from '../util/htmlx';
 import { stripCommonIndent } from '../util/string';
 import type { ProcessResult, BlockInfo } from '../types';
@@ -121,13 +121,13 @@ ${tsCode}`);
       if (civetPreprocessorDebug) console.log(`[preprocessCivet] originalContentStartLine_1based: ${civetContentStartLine}, snippet offset (0-based): ${civetSnippetStartLineIndex}`);
 
       // Normalize the Civet sourcemap to a standard V3 map
-      const mapFromNormalize = normalize(
+      const mapFromNormalize = normalizeCivetMap(
         civetMapRaw,
-        tsCode,
-        { getText: () => svelteCode, filename },
-        civetCompileOptions,
+        svelteCode,
         civetContentStartLine,
-        indentLen
+        indentLen,
+        filename,
+        tsCode
       );
       // Debug: log first segment of normalized map mappings
       if (civetPreprocessorDebug) console.log(`[civetPreprocessor.ts] normalized map first semicolon segment: ${mapFromNormalize.mappings.split(';')[0]}`);

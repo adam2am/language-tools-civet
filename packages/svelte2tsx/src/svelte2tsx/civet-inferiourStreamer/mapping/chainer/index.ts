@@ -60,6 +60,19 @@ export function chainCivetMaps(
     blocks.forEach((block, i) => console.log(`[CHAIN_MAPS] Block ${i}: originalLines=${block.civet.lineCount}, compiledLines=${block.ts.lineCount}, tsStartChar=${block.tsSnippet.startOffset}, tsEndChar=${block.tsSnippet.endOffset}, tsStartLine=${block.tsSnippet.startLine}, svelteOffset_0_based=${block.svelte.civetStartIndex}, removedIndent=${block.sourceIndent.commonLength}, mapFile=${block.map.file}, mapSources=${JSON.stringify(block.map.sources)}`));
   }
 
+  const finalNames = [...baseMap.names];
+  const nameOffsets: number[] = [];
+  if (chainCivetDebug) console.log(`[CHAIN_MAPS_NAMES] Base map has ${baseMap.names.length} names.`);
+  for (const block of blocks) {
+      nameOffsets.push(finalNames.length);
+      if (block.map.names) {
+          finalNames.push(...block.map.names);
+          if (chainCivetDebug) console.log(`[CHAIN_MAPS_NAMES] Added ${block.map.names.length} names. New total: ${finalNames.length}. Offset for this block: ${nameOffsets[nameOffsets.length - 1]}`);
+      } else {
+        if (chainCivetDebug) console.log(`[CHAIN_MAPS_NAMES] Block had no names. Total: ${finalNames.length}. Offset for this block: ${nameOffsets[nameOffsets.length - 1]}`);
+      }
+  }
+
   const preprocessedLineOffsetIndex = new lineOffsetIndex(svelteWithTsContent);
   const baseLines = decode(baseMap.mappings);
   if (chainCivetDebug) console.log('[CHAIN_MAPS] Decoded baseMap segments (first 5 lines):', JSON.stringify(baseLines.slice(0,5)));
@@ -77,24 +90,6 @@ export function chainCivetMaps(
     sourcesContent: block.map.sourcesContent
     });
   });
-
-  // Combine names from all blocks into the base map and create a re-indexing map.
-  const finalNames = [...baseMap.names];
-  const nameMap = new Map<string, number>(finalNames.map((name, i) => [name, i]));
-  const blockNameMaps: (Map<number, number> | undefined)[] = blocks.map(block => {
-      if (!block.map.names?.length) return undefined;
-      const blockMap = new Map<number, number>();
-      for (let i = 0; i < block.map.names.length; i++) {
-          const name = block.map.names[i];
-          if (!nameMap.has(name)) {
-              nameMap.set(name, finalNames.length);
-              finalNames.push(name);
-          }
-          blockMap.set(i, nameMap.get(name)!);
-      }
-      return blockMap;
-  });
-  if (chainCivetDebug) console.log(`[CHAIN_MAPS] Merged all names. Final count: ${finalNames.length}`);
 
   const lineDeltas: number[] = [0]; 
   let currentCumulativeDelta = 0;
@@ -138,7 +133,7 @@ export function chainCivetMaps(
       }
     }
     // Remap script segments via trace-mapping
-    const codeLines = mapScriptSegments(codeSegs, blocks, tracers, blockNameMaps, chainCivetDebug);
+    const codeLines = mapScriptSegments(codeSegs, blocks, tracers, nameOffsets, chainCivetDebug);
     
     // Remap template segments by adjusting line delta
     const tmplLines = mapTemplateSegments(tmplSegs, blocks, lineDeltas);
