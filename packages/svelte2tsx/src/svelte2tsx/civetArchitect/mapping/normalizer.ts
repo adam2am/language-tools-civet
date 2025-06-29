@@ -4,6 +4,7 @@ import type { LinesMap } from '../types';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
 
 const DBG = !!process.env.CIVET_NORM_DEBUG; // enable with ENV var
+const MAX_LOOKAHEAD = 3;
 
 // ---------------------------------------------------------------------------
 //  FAST PER-LINE LITERAL/COMMENT SPAN DETECTOR
@@ -157,24 +158,45 @@ function locateTokenInCivetLine(
 
   const treatAsOperator = anchor.kind === 'operator' || keywordOverride !== undefined;
 
-  if (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || anchor.kind === 'keyword' && !treatAsOperator) {
+  if (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || (anchor.kind === 'keyword' && !treatAsOperator)) {
     if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier-like token (kind: ${anchor.kind}).`);
-    let searchRegex = identifierRegexCache.get(searchText);
-    if (!searchRegex) {
-    const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
-      identifierRegexCache.set(searchText, searchRegex);
-    }
-    searchRegex.lastIndex = searchFrom; 
-    let match: RegExpExecArray | null;
-    while ((match = searchRegex.exec(civetLineText))) {
-        const candidateIdx = match.index;
-        if (!isInsideLiteral(candidateIdx, getLiteralRanges(civetLineText))) {
-          foundIndex = candidateIdx;
-          break;
+
+    // Tweak #3: Fast path for single-character tokens to avoid regex overhead.
+    if (searchText.length === 1) {
+        let currentPos = searchFrom;
+        while ((currentPos = civetLineText.indexOf(searchText, currentPos)) !== -1) {
+            if (isInsideLiteral(currentPos, getLiteralRanges(civetLineText))) {
+                currentPos++;
+                continue;
+            }
+            const prevChar = civetLineText[currentPos - 1];
+            const nextChar = civetLineText[currentPos + 1];
+            const isWordChar = (c: string) => c && /\p{L}|\p{N}|_|\$/u.test(c);
+
+            if (!isWordChar(prevChar) && !isWordChar(nextChar)) {
+                foundIndex = currentPos;
+                break; 
+            }
+            currentPos++;
         }
-        // otherwise continue searching after this match
-        searchRegex.lastIndex = candidateIdx + 1;
+    } else {
+        let searchRegex = identifierRegexCache.get(searchText);
+        if (!searchRegex) {
+        const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
+          identifierRegexCache.set(searchText, searchRegex);
+        }
+        searchRegex.lastIndex = searchFrom; 
+        let match: RegExpExecArray | null;
+        while ((match = searchRegex.exec(civetLineText))) {
+            const candidateIdx = match.index;
+            if (!isInsideLiteral(candidateIdx, getLiteralRanges(civetLineText))) {
+              foundIndex = candidateIdx;
+              break;
+            }
+            // otherwise continue searching after this match
+            searchRegex.lastIndex = candidateIdx + 1;
+        }
     }
   } else if (treatAsOperator) {
     const aliasCandidates: string[] = [];
@@ -358,6 +380,7 @@ function buildDenseMapLines(
 ) {
   const decoded: number[][][] = [];
   const nextSearchIndexCache = new Map<string, number>();
+  const claimedSpans = new Set<string>(); // Tweak #2: Guard against duplicate mappings
 
   for (let i = 0; i < tsLines.length; i++) {
     const lineAnchors = anchorsByLine.get(i) || [];
@@ -414,14 +437,19 @@ function buildDenseMapLines(
         // Find the segment whose generated column range contains the anchor's start.
         // The list is sorted by generated column, so we can find the last
         // segment that starts *before or at* the anchor's column. This is our segment.
-        let bestSeg = segList[0]; // Default to first segment
-        for (const seg of segList) {
+        
+        // Tweak #1: Use binary search instead of linear scan.
+        let lo = 0;
+        let hi = segList.length - 1;
+        let bestSeg = segList[0];
+        while (lo <= hi) {
+            const mid = (lo + hi) >>> 1;
+            const seg = segList[mid];
             if (seg.genCol <= anchor.start.character) {
                 bestSeg = seg;
+                lo = mid + 1;
             } else {
-                // Since the list is sorted, we've gone past our anchor.
-                // The last `bestSeg` we saw is the correct one.
-                break;
+                hi = mid - 1;
             }
         }
         civetLineIndex = bestSeg.civetLine;
@@ -460,9 +488,8 @@ function buildDenseMapLines(
       locationInfo = locateTokenInCivetLine(anchor, civetLineText, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
       
       if (locationInfo === undefined && civetLineIndex !== undefined) {
-        // Heuristic fallback: Try up to 3 subsequent Civet lines in case multiple Civet lines
+        // Heuristic fallback: Try up to N subsequent Civet lines in case multiple Civet lines
         // were flattened onto the same TS line and the raw map missed these tokens.
-        const MAX_LOOKAHEAD = 3;
         for (let delta = 1; delta <= MAX_LOOKAHEAD && !locationInfo; delta++) {
           const altLineIdx = civetLineIndex + delta;
           if (altLineIdx >= civetCodeLines.length) break;
@@ -488,55 +515,60 @@ function buildDenseMapLines(
       }
       
       if (locationInfo) {
-        const newEndExclusive = locationInfo.startIndex + locationInfo.length;
-        nextSearchIndexCache.set(cacheKey, newEndExclusive);
-      }
+        const spanKey = `${civetLineIndex}:${locationInfo.startIndex}:${locationInfo.length}`;
+        if (claimedSpans.has(spanKey)) {
+             if (DBG) console.log(`[DENSE_MAP_SKIP] Span ${spanKey} for token '${anchor.text}' already claimed.`);
+             lineSegments.push([anchor.start.character]);
+        } else {
+            claimedSpans.add(spanKey);
+            const newEndExclusive = locationInfo.startIndex + locationInfo.length;
+            nextSearchIndexCache.set(cacheKey, newEndExclusive);
 
-      if (locationInfo !== undefined) {
-        const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
-        const sourceSvelteStartCol = locationInfo.startIndex + indentation;
-        const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
-        
-        const tokenLength = locationInfo.length;
-        const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength;
+            const sourceSvelteLine = (civetBlockStartLine - 1) + civetLineIndex;
+            const sourceSvelteStartCol = locationInfo.startIndex + indentation;
+            const nameIdx = anchor.kind === 'identifier' ? names.indexOf(anchor.text) : -1;
+            
+            const tokenLength = locationInfo.length;
+            const sourceSvelteEndColExclusive = sourceSvelteStartCol + tokenLength;
 
-        // Add an edge mapping only for identifiers (multi-char) or multi-char tokens.
-        const lastMappedChar = civetLineText[locationInfo.startIndex + tokenLength - 1];
-        const genEdgeCol = anchor.end.character; // first char AFTER the token in TS
-        if (
-          (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || tokenLength > 1) &&
-          !(lastMappedChar === ' ' || lastMappedChar === '\t')
-        ) {
-        lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
-        }
+            // Add an edge mapping only for identifiers (multi-char) or multi-char tokens.
+            const lastMappedChar = civetLineText[locationInfo.startIndex + tokenLength - 1];
+            const genEdgeCol = anchor.end.character; // first char AFTER the token in TS
+            if (
+              (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || tokenLength > 1) &&
+              !(lastMappedChar === ' ' || lastMappedChar === '\t')
+            ) {
+            lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+            }
 
-        // Point 1: Map token start
-        const startSegment: number[] = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
-        if (nameIdx > -1) startSegment.push(nameIdx);
-        lineSegments.push(startSegment);
-        
-        let endSegment: number[] | undefined;
-        // Point 1: Map token end (inclusive) to ensure full token coverage, but
-        // only if the token spans more than one character. For single-character
-        // tokens (like '=' or ';') the start and end columns are identical and
-        // emitting both would create a duplicate segment.
-        if (tokenLength > 1) {
-          endSegment = [anchor.end.character - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive - 1];
-        if (nameIdx > -1) endSegment.push(nameIdx);
-        lineSegments.push(endSegment);
-        }
+            // Point 1: Map token start
+            const startSegment: number[] = [anchor.start.character, 0, sourceSvelteLine, sourceSvelteStartCol];
+            if (nameIdx > -1) startSegment.push(nameIdx);
+            lineSegments.push(startSegment);
+            
+            let endSegment: number[] | undefined;
+            // Point 1: Map token end (inclusive) to ensure full token coverage, but
+            // only if the token spans more than one character. For single-character
+            // tokens (like '=' or ';') the start and end columns are identical and
+            // emitting both would create a duplicate segment.
+            if (tokenLength > 1) {
+              endSegment = [anchor.end.character - 1, 0, sourceSvelteLine, sourceSvelteEndColExclusive - 1];
+            if (nameIdx > -1) endSegment.push(nameIdx);
+            lineSegments.push(endSegment);
+            }
 
-        if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
-            console.log(
-              `[MAP  ] Svelte L${sourceSvelteLine+1} C${sourceSvelteStartCol}-${sourceSvelteEndColExclusive-1}`
-            );
-        }
+            if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+                console.log(
+                  `[MAP  ] Svelte L${sourceSvelteLine+1} C${sourceSvelteStartCol}-${sourceSvelteEndColExclusive-1}`
+                );
+            }
 
-        if (DEBUG_TOKEN && anchor.text === 'abc') {
-            console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
-            console.log(`- TS Start: ${anchor.start.character}, End: ${anchor.end.character}`);
-            console.log(`- Svelte Start: ${sourceSvelteStartCol}, End: ${sourceSvelteEndColExclusive}`);
-            console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment ?? [], [genEdgeCol]])}\n`);
+            if (DEBUG_TOKEN && anchor.text === 'abc') {
+                console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
+                console.log(`- TS Start: ${anchor.start.character}, End: ${anchor.end.character}`);
+                console.log(`- Svelte Start: ${sourceSvelteStartCol}, End: ${sourceSvelteEndColExclusive}`);
+                console.log(`- Generated segments: ${JSON.stringify([startSegment, endSegment ?? [], [genEdgeCol]])}\n`);
+            }
         }
       } else {
         // Could not find in original line, treat as generated.
