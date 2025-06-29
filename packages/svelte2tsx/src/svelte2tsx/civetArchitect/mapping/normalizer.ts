@@ -3,6 +3,8 @@ import type { EncodedSourceMap } from '@jridgewell/gen-mapping';
 import type { LinesMap } from '../types';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
 
+const DBG = !!process.env.CIVET_NORM_DEBUG; // enable with ENV var
+
 // ---------------------------------------------------------------------------
 //  FAST PER-LINE LITERAL/COMMENT SPAN DETECTOR
 //
@@ -127,6 +129,12 @@ function locateTokenInCivetLine(
   debug: boolean,
   searchFrom = 0
 ): { startIndex: number; length: number } | undefined {
+  if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+    console.log(
+      `[LOCATE] looking for "${anchor.text}" (kind=${anchor.kind}) ` +
+      `in Civet line ${anchor.start.line}: “${civetLineText}”`
+    );
+  }
   // Hybrid override: If the token is a TS keyword that has a Civet alias in
   // `operatorLookup`, we want to search for that alias (".=" / ":=" / "->")
   // and treat the search behaviour like an operator rather than a word.
@@ -193,16 +201,21 @@ function locateTokenInCivetLine(
       let operatorRegex = operatorRegexCache.get(trimmedText);
       if (!operatorRegex) {
         const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
+        // Original buggy regex:
+        // operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
+        //
+        // Corrected regex with word boundaries to prevent matching inside identifiers.
+        // E.g., it will not match ` is ` inside `thisIsATest`.
+        operatorRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedOperator}(?![\\p{L}\\p{N}_$])`, 'gu');
         operatorRegexCache.set(trimmedText, operatorRegex);
       }
 
       operatorRegex.lastIndex = searchFrom;
       let matchRes: RegExpExecArray | null;
       while ((matchRes = operatorRegex.exec(civetLineText))) {
-        const fullMatch = matchRes[0];
-        const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-        const candidateIdx = matchRes.index + leadingSpace;
+        // With the new regex, the match is exactly the token, no leading/trailing space.
+        const candidateIdx = matchRes.index;
+
         if (isInsideLiteral(candidateIdx, getLiteralRanges(civetLineText))) {
           operatorRegex.lastIndex = candidateIdx + 1;
           continue; // skip match inside literal
@@ -210,18 +223,30 @@ function locateTokenInCivetLine(
         foundIndex = candidateIdx;
         // Map only the non-whitespace alias characters so the end maps to the last letter, not the space.
         const aliasLen = trimmedText.length;
+        if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+            console.log(`[FOUND ] start=${foundIndex}, len=${aliasLen}`);
+        }
         return { startIndex: foundIndex, length: aliasLen };
       }
     }
   } else {
     if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
     let idx = civetLineText.indexOf(searchText, searchFrom);
-    // Allow string literals to be found even if they are inside a "literal range"
-    if ((anchor.kind as string) !== 'stringLiteral') {
-      while (idx !== -1 && isInsideLiteral(idx, getLiteralRanges(civetLineText))) {
+
+    const literalRanges = getLiteralRanges(civetLineText);
+
+    if ((anchor.kind as string) === 'stringLiteral') {
+      // For string literals, we ONLY want matches that start inside a literal span.
+      while (idx !== -1 && !isInsideLiteral(idx, literalRanges)) {
+        idx = civetLineText.indexOf(searchText, idx + 1);
+      }
+    } else {
+      // For all other tokens, SKIP matches that are inside a literal.
+      while (idx !== -1 && isInsideLiteral(idx, literalRanges)) {
         idx = civetLineText.indexOf(searchText, idx + 1);
       }
     }
+
     foundIndex = idx;
   }
 
@@ -235,6 +260,9 @@ function locateTokenInCivetLine(
 
   // Note: for treatAsOperator we already returned from inside the branch when matched.
   const matchLength = searchText.length;
+  if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+    console.log(`[FOUND ] start=${foundIndex}, len=${matchLength}`);
+  }
   return { startIndex: foundIndex, length: matchLength };
 }
 
@@ -245,14 +273,27 @@ function buildLookupTables(
 ) {
   // Create a quick lookup to find the approximate Civet snippet line for a given TS line.
   const tsLineToCivetLineMap = new Map<number, number>();
+
+  // First pass: direct mappings from the Civet map.
   civetMap.lines.forEach((segments, tsLineIdx) => {
     for (const seg of segments) {
       if (seg.length >= 4) {
         tsLineToCivetLineMap.set(tsLineIdx, seg[2]);
-        return;
+        break;
       }
     }
   });
+
+  // Second pass: propagate the last known Civet line to TS lines that lack one.
+  let lastKnownCivetLine: number | undefined = undefined;
+  const totalTsLines = civetMap.lines.length;
+  for (let tsIdx = 0; tsIdx < totalTsLines; tsIdx++) {
+    if (tsLineToCivetLineMap.has(tsIdx)) {
+      lastKnownCivetLine = tsLineToCivetLineMap.get(tsIdx);
+    } else if (lastKnownCivetLine !== undefined) {
+      tsLineToCivetLineMap.set(tsIdx, lastKnownCivetLine);
+    }
+  }
 
   // Collect identifiers that are compiler-generated to map them to null.
   const generatedIdentifiers = new Set<string>();
@@ -280,7 +321,28 @@ function buildLookupTables(
 
   const names = Array.from(new Set(tsAnchors.filter(a => a.kind === 'identifier').map(a => a.text)));
   
-  return { tsLineToCivetLineMap, generatedIdentifiers, anchorsByLine, names };
+  // Build a detailed lookup: for each TS line, keep every raw mapping segment
+  // so we can later choose the Civet line whose generated column range actually
+  // covers a given anchor. This eliminates "first segment wins" errors.
+  const civetSegmentsByTsLine = new Map<number, { genCol: number; civetLine: number }[]>();
+  civetMap.lines.forEach((segments, tsLineIdx) => {
+    for (const seg of segments) {
+      if (seg.length >= 4) {
+        const genCol = seg[0];
+        const civetLine = seg[2];
+        if (!civetSegmentsByTsLine.has(tsLineIdx)) {
+          civetSegmentsByTsLine.set(tsLineIdx, []);
+        }
+        civetSegmentsByTsLine.get(tsLineIdx)!.push({ genCol, civetLine });
+      }
+    }
+  });
+  // Ensure each segment list is sorted by generated column ascending.
+  for (const list of civetSegmentsByTsLine.values()) {
+    list.sort((a, b) => a.genCol - b.genCol);
+  }
+
+  return { tsLineToCivetLineMap, civetSegmentsByTsLine, generatedIdentifiers, anchorsByLine, names };
 }
 
 function buildDenseMapLines(
@@ -288,6 +350,7 @@ function buildDenseMapLines(
   anchorsByLine: Map<number, Anchor[]>,
   generatedIdentifiers: Set<string>,
   tsLineToCivetLineMap: Map<number, number>,
+  civetSegmentsByTsLine: Map<number, { genCol: number; civetLine: number }[]>,
   civetCodeLines: string[],
   operatorLookup: Record<string, string | string[]>,
   civetBlockStartLine: number,
@@ -309,6 +372,13 @@ function buildDenseMapLines(
       let anchor = lineAnchors[aIdx];
       let searchTextOverride: string | undefined;
       let consumedAnchors = 0;
+
+      if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+        console.log(
+          `\n[DENSE] TS(${i}:${anchor.start.character}-${anchor.end.character}) ` +
+          `→ trying to map "${anchor.text}"`
+        );
+      }
 
       // --- Lookahead for `unless` pattern: `if (!` ---
       if (anchor.kind === 'keyword' && anchor.text === 'if') {
@@ -337,7 +407,23 @@ function buildDenseMapLines(
 
       // --- Determine mapping for the current token ---
       const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
-      const civetLineIndex = tsLineToCivetLineMap.get(i);
+      let civetLineIndex: number | undefined;
+      const segList = civetSegmentsByTsLine.get(i);
+      if (segList && segList.length) {
+        // Default to the first mapping on the line
+        civetLineIndex = segList[0].civetLine;
+        // Find the last segment whose generated column is <= the anchor column
+        for (const seg of segList) {
+          if (seg.genCol <= anchor.start.character) {
+            civetLineIndex = seg.civetLine;
+          } else {
+            break;
+          }
+        }
+      } else {
+        // Fallback to simple per-line inheritance map
+        civetLineIndex = tsLineToCivetLineMap.get(i);
+      }
 
       if (isGenerated || civetLineIndex === undefined) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Generated/unmappable token '${anchor.text}' at ${i}:${anchor.start.character}`);
@@ -416,6 +502,12 @@ function buildDenseMapLines(
         lineSegments.push(endSegment);
         }
 
+        if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+            console.log(
+              `[MAP  ] Svelte L${sourceSvelteLine+1} C${sourceSvelteStartCol}-${sourceSvelteEndColExclusive-1}`
+            );
+        }
+
         if (DEBUG_TOKEN && anchor.text === 'abc') {
             console.log(`\n[TOKEN_BOUNDARY_DEBUG] Token '${anchor.text}':`);
             console.log(`- TS Start: ${anchor.start.character}, End: ${anchor.end.character}`);
@@ -424,6 +516,9 @@ function buildDenseMapLines(
         }
       } else {
         // Could not find in original line, treat as generated.
+        if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
+            console.log('[MISS ] locateTokenInCivetLine returned undefined');
+        }
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Could not find '${anchor.text}' in Civet line, null mapping at ${i}:${anchor.start.character}`);
         lineSegments.push([anchor.start.character]);
       }
@@ -558,6 +653,7 @@ export function normalizeCivetMap(
 
   const {
     tsLineToCivetLineMap,
+    civetSegmentsByTsLine,
     generatedIdentifiers,
     anchorsByLine,
     names
@@ -568,6 +664,7 @@ export function normalizeCivetMap(
     anchorsByLine,
     generatedIdentifiers,
     tsLineToCivetLineMap,
+    civetSegmentsByTsLine,
     civetCodeLines,
     operatorLookup,
     civetBlockStartLine,
