@@ -132,7 +132,7 @@ function locateTokenInCivetLine(
   if (DBG && (anchor.text === 'title1' || anchor.text === 'title2')) {
     console.log(
       `[LOCATE] looking for "${anchor.text}" (kind=${anchor.kind}) ` +
-      `in Civet line ${anchor.start.line}: “${civetLineText}”`
+      `in Civet line ${anchor.start.line}: " ${civetLineText} "`
     );
   }
   // Hybrid override: If the token is a TS keyword that has a Civet alias in
@@ -165,7 +165,7 @@ function locateTokenInCivetLine(
       searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
       identifierRegexCache.set(searchText, searchRegex);
     }
-    searchRegex.lastIndex = searchFrom;
+    searchRegex.lastIndex = searchFrom; 
     let match: RegExpExecArray | null;
     while ((match = searchRegex.exec(civetLineText))) {
         const candidateIdx = match.index;
@@ -194,21 +194,30 @@ function locateTokenInCivetLine(
     }
 
     for (const candidate of aliasCandidates) {
+      // Fast-path: single-character operator → simple indexOf
+      if (candidate.length === 1) {
+        const idx = civetLineText.indexOf(candidate, searchFrom);
+        if (idx !== -1 && !isInsideLiteral(idx, getLiteralRanges(civetLineText))) {
+          foundIndex = idx;
+          return { startIndex: idx, length: 1 };
+        }
+        continue;
+      }
       if (debug) console.log(`[FIX_VERIFY] Trying operator alias "${candidate}" for "${anchor.text}".`);
       const trimmedText = candidate.trim();
       if (!trimmedText) continue;
 
-      let operatorRegex = operatorRegexCache.get(trimmedText);
-      if (!operatorRegex) {
-        const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        let operatorRegex = operatorRegexCache.get(trimmedText);
+        if (!operatorRegex) {
+            const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         // Original buggy regex:
         // operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
         //
         // Corrected regex with word boundaries to prevent matching inside identifiers.
         // E.g., it will not match ` is ` inside `thisIsATest`.
         operatorRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedOperator}(?![\\p{L}\\p{N}_$])`, 'gu');
-        operatorRegexCache.set(trimmedText, operatorRegex);
-      }
+            operatorRegexCache.set(trimmedText, operatorRegex);
+        }
 
       operatorRegex.lastIndex = searchFrom;
       let matchRes: RegExpExecArray | null;
@@ -361,7 +370,6 @@ function buildDenseMapLines(
 ) {
   const decoded: number[][][] = [];
   const nextSearchIndexCache = new Map<string, number>();
-  const claimedRangesByLine = new Map<number, { start: number; end: number }[]>();
 
   for (let i = 0; i < tsLines.length; i++) {
     const lineAnchors = anchorsByLine.get(i) || [];
@@ -409,20 +417,34 @@ function buildDenseMapLines(
       const isGenerated = anchor.kind === 'identifier' && generatedIdentifiers.has(anchor.text);
       let civetLineIndex: number | undefined;
       const segList = civetSegmentsByTsLine.get(i);
-      if (segList && segList.length) {
-        // Default to the first mapping on the line
-        civetLineIndex = segList[0].civetLine;
-        // Find the last segment whose generated column is <= the anchor column
-        for (const seg of segList) {
-          if (seg.genCol <= anchor.start.character) {
-            civetLineIndex = seg.civetLine;
+
+      if (DBG || anchor.text === 'title1') {
+        console.log(`\n[DEBUGGER] Processing anchor: ${JSON.stringify(anchor)} on TS line ${i}`);
+      }
+
+      if (segList && segList.length > 0) {
+        // Binary-search the last segment whose genCol ≤ anchor column
+        let lo = 0, hi = segList.length - 1, bestSeg = segList[0];
+        while (lo <= hi) {
+          const mid = (lo + hi) >>> 1;
+          if (segList[mid].genCol <= anchor.start.character) {
+            bestSeg = segList[mid];
+            lo = mid + 1;
           } else {
-            break;
+            hi = mid - 1;
           }
         }
+        civetLineIndex = bestSeg.civetLine;
       } else {
-        // Fallback to simple per-line inheritance map
+        // Fallback to simple per-line inheritance map if no detailed segments exist for this line.
         civetLineIndex = tsLineToCivetLineMap.get(i);
+      }
+
+      if (DBG || anchor.text === 'title1') {
+        console.log(`[DEBUGGER] Determined civetLineIndex: ${civetLineIndex}`);
+        if (civetLineIndex !== undefined) {
+          console.log(`[DEBUGGER] Civet line content: "${civetCodeLines[civetLineIndex]}"`);
+        }
       }
 
       if (isGenerated || civetLineIndex === undefined) {
@@ -444,28 +466,40 @@ function buildDenseMapLines(
       const cacheKey = `${civetLineIndex}:${searchText}`;
       let locationInfo;
       
-      while (true) {
-        const searchFrom = nextSearchIndexCache.get(cacheKey) ?? 0;
-        locationInfo = locateTokenInCivetLine(anchor, civetLineText, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
-
-        if (locationInfo === undefined) {
-          break; // no further occurrence found
+      const searchFrom = nextSearchIndexCache.get(cacheKey) ?? 0;
+      locationInfo = locateTokenInCivetLine(anchor, civetLineText, operatorLookup, DEBUG_DENSE_MAP, searchFrom);
+      
+      if (locationInfo === undefined && civetLineIndex !== undefined) {
+        // Heuristic fallback: Try up to 3 subsequent Civet lines in case multiple Civet lines
+        // were flattened onto the same TS line and the raw map missed these tokens.
+        const MAX_LOOKAHEAD = 3;
+        for (let delta = 1; delta <= MAX_LOOKAHEAD && !locationInfo; delta++) {
+          const altLineIdx = civetLineIndex + delta;
+          if (altLineIdx >= civetCodeLines.length) break;
+          const altCacheKey = `${altLineIdx}:${searchText}`;
+          const altSearchFrom = nextSearchIndexCache.get(altCacheKey) ?? 0;
+          const altLineText = civetCodeLines[altLineIdx];
+          const altLoc = locateTokenInCivetLine(anchor, altLineText, operatorLookup, DEBUG_DENSE_MAP, altSearchFrom);
+          if (altLoc) {
+            civetLineIndex = altLineIdx;
+            locationInfo = altLoc;
+            const newEndExclusive = altLoc.startIndex + altLoc.length;
+            nextSearchIndexCache.set(altCacheKey, newEndExclusive);
+            if (DBG || anchor.text === 'title1' || anchor.text === 'title2') {
+              console.log(`[DEBUGGER] Fallback matched on line +${delta} (index ${altLineIdx}): ${JSON.stringify(altLoc)}`);
+            }
+            break;
+          }
         }
+      }
 
-        const newStart = locationInfo.startIndex;
-        const newEndExclusive = newStart + locationInfo.length;
-        
+      if (DBG || anchor.text === 'title1' || anchor.text === 'title2') {
+        console.log(`[DEBUGGER] Result from locateTokenInCivetLine: ${JSON.stringify(locationInfo)}`);
+      }
+      
+      if (locationInfo) {
+        const newEndExclusive = locationInfo.startIndex + locationInfo.length;
         nextSearchIndexCache.set(cacheKey, newEndExclusive);
-
-        const existingRanges = claimedRangesByLine.get(civetLineIndex) || [];
-        const overlaps = existingRanges.some(r => newStart < r.end && newEndExclusive > r.start);
-        
-        if (!overlaps) {
-          // Reserve this range and exit loop
-          existingRanges.push({ start: newStart, end: newEndExclusive });
-          claimedRangesByLine.set(civetLineIndex, existingRanges);
-          break;
-        }
       }
 
       if (locationInfo !== undefined) {
