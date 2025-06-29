@@ -12,7 +12,7 @@ export interface Anchor {
 export function collectAnchorsFromTs(
     tsCode: string,
     svelteFilePath: string,
-    OPERATOR_MAP: Record<string, string>
+    OPERATOR_MAP: Record<string, string | string[]>
 ): Anchor[] {
     const tsAnchors: Anchor[] = [];
     // Reference to avoid unused parameter lint errors

@@ -184,6 +184,71 @@ describe('Complex sourcemap validation for generated code #current', () => {
     });
     console.log('=== END FULL NORMALIZED MAP ===\n');
 
+    // === ADDED: SHOWCASE FINAL TSX + REVERSE/FORWARD MAPPING FOR SIMPLE "if" LINES ===
+    const tsxLinesArr = tsxCode.split('\n');
+    const svelteLinesAll = svelte.split('\n');
+
+    // Identify the TSX lines that correspond to our two simple `if` statements
+    const tsxIfLinesInfo: Array<{ lineText: string; tsxLineNumber: number }> = [];
+    tsxLinesArr.forEach((lineText, idx) => {
+        if (/(12 !== 3)|(45 !== 67)/.test(lineText)) {
+            tsxIfLinesInfo.push({ lineText, tsxLineNumber: idx + 1 }); // 1-based
+        }
+    });
+
+    console.log('\n=== FINAL TSX OUTPUT (POST-NORMALIZATION) – SIMPLE "if" STATEMENTS ===');
+    tsxIfLinesInfo.forEach(({ lineText, tsxLineNumber }) => {
+        console.log(`${String(tsxLineNumber).padStart(3)}| ${lineText}`);
+
+        // Character-by-character reverse mapping (TSX -> Svelte)
+        console.log(`--- Reverse mapping for TSX line ${tsxLineNumber} (to Svelte)`);
+        let lastTrace: ReturnType<typeof originalPositionFor> | null = null;
+        for (let col = 0; col < lineText.length; col++) {
+            const char = lineText[col];
+            const trace = originalPositionFor(tracer, { line: tsxLineNumber, column: col });
+
+            let mappingStr: string;
+            if (trace.line === null) {
+                mappingStr = 'null';
+            } else if (lastTrace && trace.line === lastTrace.line && trace.column === lastTrace.column) {
+                mappingStr = `inherited -> Svelte L${trace.line}:C${trace.column}`;
+            } else {
+                mappingStr = `Svelte L${trace.line}:C${trace.column}`;
+            }
+            console.log(`  TSX C${col.toString().padStart(2)} '${char}' -> ${mappingStr}`);
+            lastTrace = trace;
+        }
+    });
+
+    // Forward mapping (Svelte -> TSX) for lines 2 & 3 of the fixture
+    console.log('\n=== SVELTE -> TSX FORWARD MAPPING AFTER FULL NORMALIZATION (LINES 2 & 3) ===');
+    [2, 3].forEach((svelteLineNumber) => {
+        const svelteLineText = svelteLinesAll[svelteLineNumber - 1] || '';
+        console.log(`${String(svelteLineNumber).padStart(3)}| ${svelteLineText}`);
+        console.log(`--- Forward mapping for Svelte line ${svelteLineNumber} (to TSX)`);
+        let lastGen: ReturnType<typeof generatedPositionFor> | null = null;
+        for (let col = 0; col < svelteLineText.length; col++) {
+            const char = svelteLineText[col];
+            const genPos = generatedPositionFor(tracer, {
+                source: sourceMap.sources[0],
+                line: svelteLineNumber,
+                column: col,
+            });
+
+            let mappingStr: string;
+            if (genPos.line === null) {
+                mappingStr = 'null';
+            } else if (lastGen && genPos.line === lastGen.line && genPos.column === lastGen.column) {
+                mappingStr = `inherited -> TSX L${genPos.line}:C${genPos.column}`;
+            } else {
+                mappingStr = `TSX L${genPos.line}:C${genPos.column}`;
+            }
+            console.log(`  Svelte C${col.toString().padStart(2)} '${char}' -> ${mappingStr}`);
+            lastGen = genPos;
+        }
+    });
+    console.log('=== END ADDED SIMPLE IF MAPPING SHOWCASE ===\n');
+
     // Helper to find an identifier and check its mapping
     const assertIdentifierMapping = (
         identifier: string,

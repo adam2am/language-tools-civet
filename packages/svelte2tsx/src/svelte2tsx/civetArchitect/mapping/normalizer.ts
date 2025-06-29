@@ -4,17 +4,25 @@ import type { LinesMap } from '../types';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
 
 // ---------------------------------------------------------------------------
-//  SIMPLE REGEX CACHE  (perf optimisation #2)
-//  We compile at most one RegExp per unique token text, then reuse it across
-//  all anchors.  This saves ~30-40 µs per token on large files.
+//  SIMPLE REGEX CACHE 
+//  We compile at most one RegExp per unique token text, 
+//  then reuse it across all anchors.
 // ---------------------------------------------------------------------------
 const identifierRegexCache = new Map<string, RegExp>();
 const operatorRegexCache   = new Map<string, RegExp>();
 
+/**
+ * Helper to always return a string alias (defaults to first element if array).
+ */
+function pickFirstAlias(alias: string | string[] | undefined): string | undefined {
+  if (alias === undefined) return undefined;
+  return Array.isArray(alias) ? alias[0] : alias;
+}
+
 function locateTokenInCivetLine(
   anchor: Anchor,
   civetLineText: string,
-  operatorLookup: Record<string, string>,
+  operatorLookup: Record<string, string | string[]>,
   debug: boolean,
   searchFrom = 0
 ): { startIndex: number; length: number } | undefined {
@@ -22,14 +30,14 @@ function locateTokenInCivetLine(
   // `operatorLookup`, we want to search for that alias (".=" / ":=" / "->")
   // and treat the search behaviour like an operator rather than a word.
 
-  const keywordOverride = (anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined
-      ? operatorLookup[anchor.text]
-      : undefined;
+  const keywordOverrideRaw = (anchor.kind as string) === 'keyword' ? operatorLookup[anchor.text] : undefined;
+  const keywordOverride = pickFirstAlias(keywordOverrideRaw);
 
+  const opAliasRaw = anchor.kind === 'operator' ? operatorLookup[anchor.text] : undefined;
   const searchText = anchor.kind === 'operator'
-    ? (operatorLookup[anchor.text] || anchor.text)
-    : ((anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined)
-      ? operatorLookup[anchor.text]
+    ? (pickFirstAlias(opAliasRaw) || anchor.text)
+    : ((anchor.kind as string) === 'keyword' && keywordOverride !== undefined)
+      ? keywordOverride
       : anchor.text;
 
   let foundIndex = -1;
@@ -55,28 +63,44 @@ function locateTokenInCivetLine(
         foundIndex = match.index;
     }
   } else if (treatAsOperator) {
-    if (debug) console.log(`[FIX_VERIFY] Using exact operator search for "${searchText}".`);
-    const trimmedText = searchText.trim();
-    if (!trimmedText) {
-        foundIndex = -1;
-    } else {
-        let operatorRegex = operatorRegexCache.get(trimmedText);
-        if (!operatorRegex) {
-            const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
-            operatorRegexCache.set(trimmedText, operatorRegex);
-        }
+    const aliasCandidates: string[] = [];
+
+    // Keyword override takes precedence.
+    if (keywordOverride) aliasCandidates.push(keywordOverride);
+
+    if (anchor.kind === 'operator') {
+      const opAlias = operatorLookup[anchor.text];
+      if (Array.isArray(opAlias)) {
+        aliasCandidates.push(...opAlias);
+      } else if (opAlias) {
+        aliasCandidates.push(opAlias);
+      }
+      // Fallback to literal operator text if no alias matched.
+      aliasCandidates.push(anchor.text);
+    }
+
+    for (const candidate of aliasCandidates) {
+      if (debug) console.log(`[FIX_VERIFY] Trying operator alias "${candidate}" for "${anchor.text}".`);
+      const trimmedText = candidate.trim();
+      if (!trimmedText) continue;
+
+      let operatorRegex = operatorRegexCache.get(trimmedText);
+      if (!operatorRegex) {
+        const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
+        operatorRegexCache.set(trimmedText, operatorRegex);
+      }
+
       operatorRegex.lastIndex = searchFrom;
-      const match = operatorRegex.exec(civetLineText);
-      if (match) {
-        const fullMatch = match[0];
+      const matchRes = operatorRegex.exec(civetLineText);
+      if (matchRes) {
+        const fullMatch = matchRes[0];
         const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-        const trailingSpace = fullMatch.length - leadingSpace - trimmedText.length;
-        // Only include trailing whitespace if the operator alias contains letters (e.g., 'unless', 'not').
-        const includeTrailing = /[A-Za-z]/.test(trimmedText);
-        foundIndex = match.index + leadingSpace;
-        const lengthIncludingTrailing = trimmedText.length + (includeTrailing ? trailingSpace : 0);
-        return { startIndex: foundIndex, length: lengthIncludingTrailing };
+        foundIndex = matchRes.index + leadingSpace;
+        // Map only the non-whitespace alias characters so the end maps to the last letter ("t"),
+        // not to the following space. Whitespace after a token is handled by null segments.
+        const aliasLen = trimmedText.length;
+        return { startIndex: foundIndex, length: aliasLen };
       }
     }
   } else {
@@ -148,7 +172,7 @@ function buildDenseMapLines(
   generatedIdentifiers: Set<string>,
   tsLineToCivetLineMap: Map<number, number>,
   civetCodeLines: string[],
-  operatorLookup: Record<string, string>,
+  operatorLookup: Record<string, string | string[]>,
   civetBlockStartLine: number,
   indentation: number,
   names: string[],
@@ -207,10 +231,12 @@ function buildDenseMapLines(
 
       // It's not a known generated token, so try to find its original position.
       const civetLineText = civetCodeLines[civetLineIndex] || '';
+      const opLookupVal = operatorLookup[anchor.text];
+      const primaryOpAlias = pickFirstAlias(opLookupVal);
       const searchText = searchTextOverride ?? (anchor.kind === 'operator'
-        ? (operatorLookup[anchor.text] || anchor.text)
-        : ((anchor.kind as string) === 'keyword' && operatorLookup[anchor.text] !== undefined)
-          ? operatorLookup[anchor.text]
+        ? (primaryOpAlias || anchor.text)
+        : ((anchor.kind as string) === 'keyword' && primaryOpAlias !== undefined)
+          ? primaryOpAlias
           : anchor.text);
       const cacheKey = `${civetLineIndex}:${searchText}`;
       let locationInfo;
@@ -251,7 +277,7 @@ function buildDenseMapLines(
         const lastMappedChar = civetLineText[locationInfo.startIndex + tokenLength - 1];
         const genEdgeCol = anchor.end.character; // first char AFTER the token in TS
         if (
-          (anchor.kind === 'identifier' || tokenLength > 1) &&
+          (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || tokenLength > 1) &&
           !(lastMappedChar === ' ' || lastMappedChar === '\t')
         ) {
         lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
@@ -339,10 +365,11 @@ export function normalizeCivetMap(
 ): EncodedSourceMap {
   // Map TS operator tokens to their Civet equivalents. Defined up-front so the
   // AST walker and later search logic can reference it safely.
-  const operatorLookup: Record<string, string> = {
+  const operatorLookup: Record<string, string | string[]> = {
     '=': '=',
     '===': ' is ',
-    '!==': ' isnt ',
+    // `!==` can originate from both `isnt` _and_ `is not` in Civet.
+    '!==': [' isnt ', ' is not '],
     '&&':  ' and ',
     '||':  ' or ',
     '!':   'not ',
