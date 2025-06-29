@@ -61,6 +61,28 @@ export function collectAnchorsFromTs(
             tsAnchors.push({ text: name, start, end, kind: 'identifier' });
         }
 
+        // Add anchors for keyword / operator tokens so we are not solely
+        // dependent on the low-level scanner (which sometimes stops early
+        // after complex template literals).
+        const kind = node.kind;
+        const isKeywordToken = kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword;
+        const isPunctuationToken = kind >= ts.SyntaxKind.FirstPunctuation && kind <= ts.SyntaxKind.LastPunctuation;
+
+        if (isKeywordToken || isPunctuationToken) {
+            const text = node.getText(tsSourceFile);
+            // Skip trivia-only or empty tokens
+            if (text.trim()) {
+                const start = tsSourceFile.getLineAndCharacterOfPosition(node.getStart(tsSourceFile, false));
+                const end = tsSourceFile.getLineAndCharacterOfPosition(node.getEnd());
+                tsAnchors.push({
+                    text,
+                    start,
+                    end,
+                    kind: isKeywordToken ? 'keyword' : 'operator'
+                });
+            }
+        }
+
         // Add anchor for "import 'path'" string literals
         if (
             ts.isStringLiteral(node) &&

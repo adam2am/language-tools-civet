@@ -72,9 +72,10 @@ function locateTokenInCivetLine(
         const fullMatch = match[0];
         const leadingSpace = fullMatch.match(/^\s*/)[0].length;
         const trailingSpace = fullMatch.length - leadingSpace - trimmedText.length;
+        // Only include trailing whitespace if the operator alias contains letters (e.g., 'unless', 'not').
+        const includeTrailing = /[A-Za-z]/.test(trimmedText);
         foundIndex = match.index + leadingSpace;
-        // Adjust length to include trailing whitespace so that the next token does not claim it.
-        const lengthIncludingTrailing = trimmedText.length + trailingSpace;
+        const lengthIncludingTrailing = trimmedText.length + (includeTrailing ? trailingSpace : 0);
         return { startIndex: foundIndex, length: lengthIncludingTrailing };
       }
     }
@@ -186,7 +187,7 @@ function buildDenseMapLines(
             consumedAnchors = 2; // We are consuming the `(` and `!` anchors now
         }
       }
-      
+
       // --- Fill gap before this token with a null mapping ---
       if (anchor.start.character > lastGenCol) {
         if (DEBUG_DENSE_MAP) console.log(`[DENSE_MAP_NULL] Gap filler at ${i}:${lastGenCol} -> ${anchor.start.character}`);
@@ -253,7 +254,7 @@ function buildDenseMapLines(
           (anchor.kind === 'identifier' || tokenLength > 1) &&
           !(lastMappedChar === ' ' || lastMappedChar === '\t')
         ) {
-          lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
+        lineSegments.push([genEdgeCol, 0, sourceSvelteLine, sourceSvelteEndColExclusive]);
         }
 
         // Point 1: Map token start
