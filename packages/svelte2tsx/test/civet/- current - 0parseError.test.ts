@@ -3,8 +3,9 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { TraceMap, originalPositionFor, generatedPositionFor } from '@jridgewell/trace-mapping';
-import { compileCivet } from '../../src/svelte2tsx/civet/compile/compiler';
-import { normalize } from '../../src/svelte2tsx/civet/mapping/normalizer';
+import { compileCivet } from '../../src/svelte2tsx/civetArchitect/compile/compiler';
+import { normalizeCivetMap as normalize } from '../../src/svelte2tsx/civetArchitect/mapping/normalizer';
+import type { EncodedSourceMap } from '@jridgewell/gen-mapping';
 //import { decode } from '@jridgewell/sourcemap-codec';
 
 describe('Complex sourcemap validation for generated code #current', () => {
@@ -41,15 +42,18 @@ describe('Complex sourcemap validation for generated code #current', () => {
         const { code: rawTsCode, rawMap } = compileCivet(civetContent, filename, {});
         console.log('\n=== STAGE 1: RAW TYPESCRIPT FROM CIVET COMPILER (pre-svelte2tsx integration) ===\n');
         console.log(rawTsCode.split('\n').map((line, i) => `${String(i + 1).padStart(3, ' ')}| ${line}`).join('\n'));
-
-        const preIntegrationMap = normalize(
-            rawMap,
-            rawTsCode,
-            { getText: () => civetContent, filename },
-            {},
-            scriptLineIndex + 1, // 1-based
-            indentLen
-        );
+        
+        let preIntegrationMap: EncodedSourceMap;
+        if ('lines' in rawMap) {
+            preIntegrationMap = normalize(
+                rawMap,
+                svelte,
+                scriptLineIndex + 1, // 1-based
+                indentLen,
+                filename,
+                rawTsCode
+            );
+        }
         const { decode: decodeForLog } = require('@jridgewell/sourcemap-codec');
         const decodedMappings = decodeForLog(preIntegrationMap.mappings);
         console.log('\n=== STAGE 2: NORMALIZED SOURCEMAP (Civet-TS -> Svelte File) (pre-svelte2tsx integration) ===');
