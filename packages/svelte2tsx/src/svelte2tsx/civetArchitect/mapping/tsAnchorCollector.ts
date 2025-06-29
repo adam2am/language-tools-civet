@@ -40,8 +40,8 @@ export function collectAnchorsFromTs(
         const tokenText = scanner.getTokenText();
         if (!tokenText.trim()) continue; // ignore trivia-like empties
 
-        const startPos = scanner.getTokenPos();
-        const endPos = scanner.getTextPos(); // exclusive end
+        const startPos = scanner.getTokenStart();
+        const endPos = scanner.getTokenEnd();
         const start = tsSourceFile.getLineAndCharacterOfPosition(startPos);
         const end = tsSourceFile.getLineAndCharacterOfPosition(endPos);
 
