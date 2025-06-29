@@ -139,13 +139,13 @@ function locateTokenInCivetLine(
   // `operatorLookup`, we want to search for that alias (".=" / ":=" / "->")
   // and treat the search behaviour like an operator rather than a word.
 
-  const keywordOverrideRaw = (anchor.kind as string) === 'keyword' ? operatorLookup[anchor.text] : undefined;
+  const keywordOverrideRaw = anchor.kind === 'keyword' ? operatorLookup[anchor.text] : undefined;
   const keywordOverride = pickFirstAlias(keywordOverrideRaw);
 
   const opAliasRaw = anchor.kind === 'operator' ? operatorLookup[anchor.text] : undefined;
   const searchText = anchor.kind === 'operator'
     ? (pickFirstAlias(opAliasRaw) || anchor.text)
-    : ((anchor.kind as string) === 'keyword' && keywordOverride !== undefined)
+    : (anchor.kind === 'keyword' && keywordOverride !== undefined)
       ? keywordOverride
       : anchor.text;
 
@@ -157,8 +157,8 @@ function locateTokenInCivetLine(
 
   const treatAsOperator = anchor.kind === 'operator' || keywordOverride !== undefined;
 
-  if (anchor.kind === 'identifier' || ((anchor.kind as string) === 'keyword' && !treatAsOperator)) {
-    if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier.`);
+  if (anchor.kind === 'identifier' || anchor.kind === 'numericLiteral' || anchor.kind === 'keyword' && !treatAsOperator) {
+    if (debug) console.log(`[FIX_VERIFY] Using Unicode-aware word boundary search for identifier-like token (kind: ${anchor.kind}).`);
     let searchRegex = identifierRegexCache.get(searchText);
     if (!searchRegex) {
     const escapedSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -194,15 +194,6 @@ function locateTokenInCivetLine(
     }
 
     for (const candidate of aliasCandidates) {
-      // Fast-path: single-character operator → simple indexOf
-      if (candidate.length === 1) {
-        const idx = civetLineText.indexOf(candidate, searchFrom);
-        if (idx !== -1 && !isInsideLiteral(idx, getLiteralRanges(civetLineText))) {
-          foundIndex = idx;
-          return { startIndex: idx, length: 1 };
-        }
-        continue;
-      }
       if (debug) console.log(`[FIX_VERIFY] Trying operator alias "${candidate}" for "${anchor.text}".`);
       const trimmedText = candidate.trim();
       if (!trimmedText) continue;
@@ -210,9 +201,6 @@ function locateTokenInCivetLine(
         let operatorRegex = operatorRegexCache.get(trimmedText);
         if (!operatorRegex) {
             const escapedOperator = trimmedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        // Original buggy regex:
-        // operatorRegex = new RegExp(`\\s*${escapedOperator}\\s*`, 'g');
-        //
         // Corrected regex with word boundaries to prevent matching inside identifiers.
         // E.g., it will not match ` is ` inside `thisIsATest`.
         operatorRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedOperator}(?![\\p{L}\\p{N}_$])`, 'gu');
@@ -239,12 +227,12 @@ function locateTokenInCivetLine(
       }
     }
   } else {
-    if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
+    if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier/numeric token (kind: ${anchor.kind}).`);
     let idx = civetLineText.indexOf(searchText, searchFrom);
 
     const literalRanges = getLiteralRanges(civetLineText);
 
-    if ((anchor.kind as string) === 'stringLiteral') {
+    if (anchor.kind === 'stringLiteral') {
       // For string literals, we ONLY want matches that start inside a literal span.
       while (idx !== -1 && !isInsideLiteral(idx, literalRanges)) {
         idx = civetLineText.indexOf(searchText, idx + 1);
@@ -423,16 +411,18 @@ function buildDenseMapLines(
       }
 
       if (segList && segList.length > 0) {
-        // Binary-search the last segment whose genCol ≤ anchor column
-        let lo = 0, hi = segList.length - 1, bestSeg = segList[0];
-        while (lo <= hi) {
-          const mid = (lo + hi) >>> 1;
-          if (segList[mid].genCol <= anchor.start.character) {
-            bestSeg = segList[mid];
-            lo = mid + 1;
-          } else {
-            hi = mid - 1;
-          }
+        // Find the segment whose generated column range contains the anchor's start.
+        // The list is sorted by generated column, so we can find the last
+        // segment that starts *before or at* the anchor's column. This is our segment.
+        let bestSeg = segList[0]; // Default to first segment
+        for (const seg of segList) {
+            if (seg.genCol <= anchor.start.character) {
+                bestSeg = seg;
+            } else {
+                // Since the list is sorted, we've gone past our anchor.
+                // The last `bestSeg` we saw is the correct one.
+                break;
+            }
         }
         civetLineIndex = bestSeg.civetLine;
       } else {
@@ -460,7 +450,7 @@ function buildDenseMapLines(
       const primaryOpAlias = pickFirstAlias(opLookupVal);
       const searchText = searchTextOverride ?? (anchor.kind === 'operator'
         ? (primaryOpAlias || anchor.text)
-        : ((anchor.kind as string) === 'keyword' && primaryOpAlias !== undefined)
+        : (anchor.kind === 'keyword' && primaryOpAlias !== undefined)
           ? primaryOpAlias
           : anchor.text);
       const cacheKey = `${civetLineIndex}:${searchText}`;
