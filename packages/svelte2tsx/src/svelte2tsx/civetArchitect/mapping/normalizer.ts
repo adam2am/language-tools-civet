@@ -4,6 +4,107 @@ import type { LinesMap } from '../types';
 import { Anchor, collectAnchorsFromTs } from './tsAnchorCollector';
 
 // ---------------------------------------------------------------------------
+//  FAST PER-LINE LITERAL/COMMENT SPAN DETECTOR
+//
+//  Identifies runs of characters that belong to:
+//    • single-quoted   string literals   '...'
+//    • double-quoted   string literals   "..."
+//    • back-tick       template literals  `...`
+//    • line comments   // ...   and   # ...
+//  (multi-line / block comments are not needed – Civet doesn't have them.)
+//  These zones are cached per unique line string so we compute them once.
+// ---------------------------------------------------------------------------
+
+type Range = { start: number; end: number }; // end is inclusive
+const literalCache = new Map<string, Range[]>();
+
+function getLiteralRanges(line: string): Range[] {
+  let cached = literalCache.get(line);
+  if (cached) return cached;
+
+  const ranges: Range[] = [];
+  const len = line.length;
+
+  let i = 0;
+  const pushRange = (s: number, e: number) => {
+    if (e >= s) ranges.push({ start: s, end: e });
+  };
+
+  while (i < len) {
+    const ch = line[i];
+
+    if (ch === "'" || ch === '"' || ch === '`') {
+      // String or template literal
+      const quote = ch;
+      const stringStart = i;
+      let currentLiteralPartStart = stringStart;
+      i++;
+
+      while (i < len) {
+        const c = line[i];
+        if (c === '\\') {
+          i += 2; // skip escaped char
+          continue;
+        }
+        
+        // Handle interpolation only for " and `
+        if ((quote === '"' || quote === '`') && c === '#' && i + 1 < len && line[i + 1] === '{') {
+            // End of the string part before interpolation.
+            pushRange(currentLiteralPartStart, i - 1);
+
+            // Skip over the interpolation block.
+            i += 2; // Move past `#{`
+            let braceLevel = 1;
+            while (i < len && braceLevel > 0) {
+                if (line[i] === '{') braceLevel++;
+                else if (line[i] === '}') braceLevel--;
+                i++;
+            }
+            // `i` is now at the character after the closing `}`.
+            // This is the start of the next part of the string literal.
+            currentLiteralPartStart = i;
+            continue; // Back to the inner string-scanning loop.
+        }
+
+        if (c === quote) {
+          pushRange(currentLiteralPartStart, i);
+          i++; // move past closing quote
+          break; // Exit the inner while loop
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Line comment detection (// or #, but not in string)
+    if (ch === '/' && i + 1 < len && line[i + 1] === '/') {
+      pushRange(i, len - 1);
+      break;
+    }
+    if (ch === '#') {
+      // Treat everything after # as comment if # is first non-space char
+      const prefix = line.slice(0, i).trim();
+      if (prefix === '') {
+        pushRange(i, len - 1);
+        break;
+      }
+    }
+
+    i++;
+  }
+
+  literalCache.set(line, ranges);
+  return ranges;
+}
+
+function isInsideLiteral(idx: number, ranges: Range[]): boolean {
+  for (const r of ranges) {
+    if (idx >= r.start && idx <= r.end) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 //  SIMPLE REGEX CACHE 
 //  We compile at most one RegExp per unique token text, 
 //  then reuse it across all anchors.
@@ -56,11 +157,16 @@ function locateTokenInCivetLine(
       searchRegex = new RegExp(`(?<![\\p{L}\\p{N}_$])${escapedSearchText}(?![\\p{L}\\p{N}_$])`, 'gu');
       identifierRegexCache.set(searchText, searchRegex);
     }
-    searchRegex.lastIndex = searchFrom; 
-
-    const match = searchRegex.exec(civetLineText);
-    if (match) {
-        foundIndex = match.index;
+    searchRegex.lastIndex = searchFrom;
+    let match: RegExpExecArray | null;
+    while ((match = searchRegex.exec(civetLineText))) {
+        const candidateIdx = match.index;
+        if (!isInsideLiteral(candidateIdx, getLiteralRanges(civetLineText))) {
+          foundIndex = candidateIdx;
+          break;
+        }
+        // otherwise continue searching after this match
+        searchRegex.lastIndex = candidateIdx + 1;
     }
   } else if (treatAsOperator) {
     const aliasCandidates: string[] = [];
@@ -92,20 +198,31 @@ function locateTokenInCivetLine(
       }
 
       operatorRegex.lastIndex = searchFrom;
-      const matchRes = operatorRegex.exec(civetLineText);
-      if (matchRes) {
+      let matchRes: RegExpExecArray | null;
+      while ((matchRes = operatorRegex.exec(civetLineText))) {
         const fullMatch = matchRes[0];
         const leadingSpace = fullMatch.match(/^\s*/)[0].length;
-        foundIndex = matchRes.index + leadingSpace;
-        // Map only the non-whitespace alias characters so the end maps to the last letter ("t"),
-        // not to the following space. Whitespace after a token is handled by null segments.
+        const candidateIdx = matchRes.index + leadingSpace;
+        if (isInsideLiteral(candidateIdx, getLiteralRanges(civetLineText))) {
+          operatorRegex.lastIndex = candidateIdx + 1;
+          continue; // skip match inside literal
+        }
+        foundIndex = candidateIdx;
+        // Map only the non-whitespace alias characters so the end maps to the last letter, not the space.
         const aliasLen = trimmedText.length;
         return { startIndex: foundIndex, length: aliasLen };
       }
     }
   } else {
     if (debug) console.log(`[FIX_VERIFY] Using indexOf search for non-identifier token (kind: ${anchor.kind}).`);
-    foundIndex = civetLineText.indexOf(searchText, searchFrom);
+    let idx = civetLineText.indexOf(searchText, searchFrom);
+    // Allow string literals to be found even if they are inside a "literal range"
+    if ((anchor.kind as string) !== 'stringLiteral') {
+      while (idx !== -1 && isInsideLiteral(idx, getLiteralRanges(civetLineText))) {
+        idx = civetLineText.indexOf(searchText, idx + 1);
+      }
+    }
+    foundIndex = idx;
   }
 
   if (debug) {
