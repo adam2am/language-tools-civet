@@ -57,6 +57,8 @@ export function getScriptKindFromAttributes(
         case 'typescript':
         case 'text/ts':
         case 'text/typescript':
+        case 'civet':
+        case 'text/civet':
             return ts.ScriptKind.TSX;
         case 'javascript':
         case 'text/javascript':
@@ -376,4 +378,49 @@ export function hasTsExtensions(fileName: string) {
 
 export function isSvelte2tsxShimFile(fileName: string | undefined) {
     return fileName?.endsWith('svelte-shims.d.ts') || fileName?.endsWith('svelte-shims-v4.d.ts');
+}
+
+export function isInCivetComment(position: Position, document: Document): boolean {
+    // Ensure we're inside a <script> tag with lang="civet" (instance or module)
+    const tagInfos = [document.scriptInfo, document.moduleScriptInfo].filter(Boolean) as Array<import('../../lib/documents/utils').TagInformation>;
+    const civetTag = tagInfos.find((t) => {
+        const lang = (t.attributes.lang || t.attributes.type || '').replace(/^text\//, '').toLowerCase();
+        return lang === 'civet';
+    });
+    if (!civetTag) {
+        return false;
+    }
+
+    const offset = document.offsetAt(position);
+    if (offset < civetTag.start || offset > civetTag.end) {
+        return false;
+    }
+
+    const text = document.getText();
+    const relativeOffset = offset - civetTag.start;
+    const scriptContentUpToPos = text.substring(civetTag.start, offset);
+
+    // Detect block comment: last /* without closing */
+    const lastBlockStart = scriptContentUpToPos.lastIndexOf('/*');
+    const lastBlockEnd = scriptContentUpToPos.lastIndexOf('*/');
+    if (lastBlockStart !== -1 && lastBlockEnd < lastBlockStart) {
+        return true;
+    }
+
+    // Detect line comments (JS-style // or Civet-style #)
+    const lastNewline = scriptContentUpToPos.lastIndexOf('\n');
+    const lineStartIdx = lastNewline === -1 ? 0 : lastNewline + 1;
+    const linePrefix = scriptContentUpToPos.substring(lineStartIdx);
+    // JS-style // comment
+    if (/^\s*\/\//.test(linePrefix)) {
+        return true;
+    }
+
+    // Detect triple-hash ### block comments (Civet/CoffeeScript)
+    const tripleHashMatches = scriptContentUpToPos.match(/###/g);
+    if (tripleHashMatches && tripleHashMatches.length % 2 === 1) {
+        return true;
+    }
+
+    return false;
 }

@@ -26,6 +26,7 @@ import {
     toRange
 } from '../../../lib/documents';
 import { AttributeContext, getAttributeContextAtPosition } from '../../../lib/documents/parseHtml';
+import { isInCivetComment } from '../utils';
 import { LSConfigManager } from '../../../ls-config';
 import { flatten, getRegExpMatches, modifyLines, pathToUrl } from '../../../utils';
 import { AppCompletionItem, AppCompletionList, CompletionsProvider } from '../../interfaces';
@@ -104,6 +105,11 @@ export class CompletionsProviderImpl implements CompletionsProvider<CompletionRe
         cancellationToken?: CancellationToken
     ): Promise<AppCompletionList<CompletionResolveInfo> | null> {
         if (isInTag(position, document.styleInfo)) {
+            return null;
+        }
+
+        // Guard against completions inside Civet line/block comments
+        if (isInCivetComment(position, document)) {
             return null;
         }
 
