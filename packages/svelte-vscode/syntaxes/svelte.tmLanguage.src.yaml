@@ -81,6 +81,11 @@ injections:
     patterns: [{begin: '(?<=>)(?!</)', end: '(?=</)', name: meta.embedded.block.svelte,
     contentName: text.pug, patterns: [{ include: text.pug }]}]
 
+  # Civet | 'civet' | 'source.civet'
+  'L:meta.script.svelte meta.lang.civet - (meta source)':
+    patterns: [{begin: '(?<=>)(?!</)', end: '(?=</)', name: meta.embedded.block.svelte,
+    contentName: source.civet, patterns: [{ include: source.civet }]}]
+
   # Default (just introduces a new scope)
   'L:meta.template.svelte - meta.lang - (meta source)':
     patterns: [{begin: '(?<=>)\s', end: '(?=</template)', patterns: [{ include: '#scope' }]}]
