@@ -100,10 +100,15 @@ export function buildLookupTables(
     list.sort((a, b) => a.genCol - b.genCol || a.civetLine - b.civetLine);
 
     // ------------------------------------------------------------------
-    // Patch for pipe-operator chains: if multiple segments share the same
-    // genCol, try to assign a more specific column by scanning the TS line
-    // for the first identifier/literal that appears in the corresponding
-    // Civet stage. This makes segList disambiguate operators like ".".
+    // Disambiguation heuristic for duplicate generated columns:
+    // If several mapping segments on the same TS line start at the identical
+    // `genCol`, we need a way to decide which Civet segment belongs to which
+    // anchor. We derive a *stable* alternative column by scanning the Civet
+    // source line for the first identifier token, locating that identifier
+    // inside the corresponding TS line, and using its column as the new
+    // `genCol`. This generic approach works for all constructs that emit
+    // duplicate columns (pipe chains, chained calls, etc.), not just
+    // operators like `.`.
     // ------------------------------------------------------------------
     const tsText = tsLines[tsIdx] || '';
     const seenCols = new Set<number>();

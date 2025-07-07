@@ -1,6 +1,17 @@
 /**
- * @file Scans a line of Civet code to identify literal and interpolation ranges.
- * literalRanges: finds strings, comments, and interpolations in a flash.
+ * @file Detects literal and interpolation ranges for a *single* line of Civet.
+ *
+ * Responsibilities:
+ *   • Mark quoted strings (', ", `) while respecting escape sequences.
+ *   • Track interpolation blocks (`#{…}` and `${…}`) inside double-quoted and
+ *     template literals, returning both the literal slice and the inner
+ *     expression slice.
+ *   • Identify line comments introduced by `//`, or by `#` **only** when the
+ *     hash is the first non-whitespace character on the line – mirroring
+ *     Civet's comment semantics.
+ *
+ * The returned `literalRanges`/`interpolationRanges` arrays contain inclusive
+ * start/end positions and are optimised for fast `isInside()` checks.
  */
 import { LITERAL_RANGES_CACHE_MAX, CACHE_TTL_MS } from '../constants';
 
