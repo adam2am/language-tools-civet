@@ -20,6 +20,7 @@
     "devDependencies": {
         "@jridgewell/sourcemap-codec": "^1.5.0",
         "@jridgewell/trace-mapping": "^0.3.25",
+        "@jridgewell/gen-mapping": "^0.3.12",
         "@rollup/plugin-commonjs": "^24.0.0",
         "@rollup/plugin-json": "^6.0.0",
         "@rollup/plugin-node-resolve": "^15.0.0",
@@ -40,11 +41,18 @@
         "svelte": "~4.2.19",
         "tiny-glob": "^0.2.6",
         "tslib": "^2.4.0",
-        "typescript": "^5.8.2"
+        "typescript": "^5.8.2",
+        "@danielx/civet": "^0.10.5"
     },
     "peerDependencies": {
         "svelte": "^3.55 || ^4.0.0-next.0 || ^4.0 || ^5.0.0-next.0",
-        "typescript": "^4.9.4 || ^5.0.0"
+        "typescript": "^4.9.4 || ^5.0.0",
+        "@danielx/civet": "^0.10.5"
+    },
+    "peerDependenciesMeta": {
+        "@danielx/civet": {
+            "optional": true
+        }
     },
     "scripts": {
         "build": "rollup -c",

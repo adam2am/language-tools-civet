@@ -11,6 +11,7 @@ import { createModuleAst, ModuleAst, processModuleScriptTag } from './processMod
 import path from 'path';
 import { parse, VERSION } from 'svelte/compiler';
 import { getTopLevelImports } from './utils/tsAst';
+import { maybePreprocessCivet, chainAllCivetBlocks } from './civet';
 
 function processSvelteTemplate(
     str: MagicString,
@@ -46,7 +47,23 @@ export function svelte2tsx(
     options.mode = options.mode || 'ts';
     options.version = options.version || VERSION;
 
-    const str = new MagicString(svelte);
+    // --- Civet pre-processing (safe no-op if no <script lang="civet"> blocks)
+    let civetModule: typeof import('@danielx/civet') | undefined;
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        civetModule = require('@danielx/civet');
+    } catch {
+        civetModule = undefined;
+    }
+
+    const { code: svelteWithTs, civetBlocks } = maybePreprocessCivet(
+        svelte,
+        options.filename,
+        options.parse || parse,
+        civetModule
+    );
+
+    const str = new MagicString(svelteWithTs);
     const basename = path.basename(options.filename || '');
     const svelte5Plus = Number(options.version![0]) > 4;
     const isTsFile = options?.isTsFile;
@@ -247,9 +264,18 @@ export function svelte2tsx(
         };
     } else {
         str.prepend('///<reference types="svelte" />\n');
+
+        const baseMap = str.generateMap({ hires: true, source: options?.filename });
+        const finalMap = chainAllCivetBlocks(
+            baseMap,
+            civetBlocks,
+            svelte,
+            str.original
+        );
+
         return {
             code: str.toString(),
-            map: str.generateMap({ hires: true, source: options?.filename }),
+            map: finalMap,
             exportedNames: exportedNames.getExportsMap(),
             events: events.createAPI(),
             // not part of the public API so people don't start using it
