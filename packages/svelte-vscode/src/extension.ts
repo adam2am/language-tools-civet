@@ -27,12 +27,15 @@ import {
 import { LanguageClient, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 import CompiledCodeContentProvider from './CompiledCodeContentProvider';
 import { activateTagClosing } from './html/autoClose';
+import * as fs from 'fs';
 import { EMPTY_ELEMENTS } from './html/htmlEmptyTagsShared';
 import { TsPlugin } from './tsplugin';
 import { addFindComponentReferencesListener } from './typescript/findComponentReferences';
 import { addFindFileReferencesListener } from './typescript/findFileReferences';
 import { setupSvelteKit } from './sveltekit';
 import { resolveCodeLensMiddleware } from './middlewares';
+
+type RegenFn = (targetPath?: string) => Promise<boolean>;
 
 namespace TagCloseRequest {
     export const type: RequestType<TextDocumentPositionParams, string, any> = new RequestType(
@@ -275,9 +278,43 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
         '**/{🐈,civetconfig,civet.config}.{json,yaml,yml,civet,js}'
     );
 
-    civetWatcher.onDidChange(() => restartLS(false));
-    civetWatcher.onDidCreate(() => restartLS(false));
-    civetWatcher.onDidDelete(() => restartLS(false));
+    async function regenerateGrammarAndRestart() {
+        // Dynamically obtain regenerateTextmate from Civet extension if present
+        try {
+            const civetExt = extensions.getExtension('DanielX.civet');
+            if (civetExt) {
+                await civetExt.activate();
+                const regen: RegenFn | undefined = (civetExt.exports
+                    ? civetExt.exports.regenerateTextmate
+                    : undefined) as RegenFn | undefined;
+
+                if (typeof regen === 'function') {
+                    const targetGrammar = path.join(
+                        context.extensionPath,
+                        'syntaxes',
+                        'civet.tmLanguage.json'
+                    );
+
+                    // ensure folder exists (packaged extension always has it)
+                    try {
+                        if (!fs.existsSync(path.dirname(targetGrammar))) {
+                            fs.mkdirSync(path.dirname(targetGrammar), { recursive: true });
+                        }
+                    } catch {}
+
+                    await regen(targetGrammar);
+                }
+            }
+        } catch (err) {
+            console.warn('[svelte-vscode] Civet grammar regeneration failed:', err);
+        }
+
+        await restartLS(false);
+    }
+
+    civetWatcher.onDidChange(regenerateGrammarAndRestart);
+    civetWatcher.onDidCreate(regenerateGrammarAndRestart);
+    civetWatcher.onDidDelete(regenerateGrammarAndRestart);
 
     context.subscriptions.push(civetWatcher);
 
