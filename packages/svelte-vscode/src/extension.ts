@@ -278,7 +278,7 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
         '**/{🐈,civetconfig,civet.config}.{json,yaml,yml,civet,js}'
     );
 
-    async function regenerateGrammarAndRestart() {
+    async function syncCivetConfigAndRestartLS(restartServer: boolean = true) {
         // Dynamically obtain regenerateTextmate from Civet extension if present
         try {
             const civetExt = extensions.getExtension('DanielX.civet');
@@ -302,21 +302,36 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
                         }
                     } catch {}
 
-                    await regen(targetGrammar);
+                    var parseOptionsResult = (await regen(targetGrammar)) as any;
                 }
             }
         } catch (err) {
             console.warn('[svelte-vscode] Civet grammar regeneration failed:', err);
         }
 
-        await restartLS(false);
+        if (restartServer) {
+            await restartLS(false);
+        }
+
+        // Forward parseOptions (after optional restart)
+        try {
+            const parseOptions = parseOptionsResult?.parseOptions ?? {};
+            getLS().sendNotification('workspace/didChangeCivetConfiguration', {
+                parseOptions
+            });
+        } catch (err) {
+            console.warn('[svelte-vscode] Failed to send Civet parseOptions to LS:', err);
+        }
     }
 
-    civetWatcher.onDidChange(regenerateGrammarAndRestart);
-    civetWatcher.onDidCreate(regenerateGrammarAndRestart);
-    civetWatcher.onDidDelete(regenerateGrammarAndRestart);
+    civetWatcher.onDidChange(() => syncCivetConfigAndRestartLS(true));
+    civetWatcher.onDidCreate(() => syncCivetConfigAndRestartLS(true));
+    civetWatcher.onDidDelete(() => syncCivetConfigAndRestartLS(true));
 
     context.subscriptions.push(civetWatcher);
+
+    // Run once on activation to get the initial Civet config
+    syncCivetConfigAndRestartLS(false);
 
     languages.setLanguageConfiguration('svelte', {
         indentationRules: {

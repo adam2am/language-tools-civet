@@ -51,6 +51,7 @@ import {
 } from './plugins/typescript/features/CodeActionsProvider';
 import { createLanguageServices } from './plugins/css/service';
 import { FileSystemProvider } from './plugins/css/FileSystemProvider';
+import { setCivetParseOptions } from './plugins/typescript/civetOptionsStore';
 
 namespace TagCloseRequest {
     export const type: RequestType<TextDocumentPositionParams, string | null, any> =
@@ -330,6 +331,11 @@ export function startServer(options?: LSOptions) {
                 workspaceSymbolProvider: true
             }
         };
+    });
+
+    // Listen for Civet config changes pushed from client
+    connection.onNotification('workspace/didChangeCivetConfiguration', (params: { parseOptions?: any }) => {
+        setCivetParseOptions(params?.parseOptions);
     });
 
     connection.onInitialized(() => {

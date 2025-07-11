@@ -10,6 +10,7 @@ import {
     Location
 } from 'vscode-languageserver';
 import { Document, isInTag, mapLocationToOriginal, mapRangeToOriginal } from '../../lib/documents';
+import { getCivetParseOptions } from './civetOptionsStore';
 import { GetCanonicalFileName, pathToUrl } from '../../utils';
 import { DocumentSnapshot, SvelteDocumentSnapshot } from './DocumentSnapshot';
 
@@ -411,15 +412,58 @@ export function isInCivetComment(position: Position, document: Document): boolea
     const lastNewline = scriptContentUpToPos.lastIndexOf('\n');
     const lineStartIdx = lastNewline === -1 ? 0 : lastNewline + 1;
     const linePrefix = scriptContentUpToPos.substring(lineStartIdx);
-    // JS-style // comment
-    if (/^\s*\/\//.test(linePrefix)) {
-        return true;
+    // --- JS-style // comment ----------------------------------------------
+    {
+        const idx = linePrefix.lastIndexOf('//');
+        if (idx !== -1) {
+            const charBefore = idx === 0 ? '' : linePrefix[idx - 1];
+            // Ensure comment delimiter is at line start or preceded by whitespace
+            if (charBefore === '' || /\s/.test(charBefore)) {
+                return true;
+            }
+        }
     }
 
-    // Detect triple-hash ### block comments (Civet/CoffeeScript)
-    const tripleHashMatches = scriptContentUpToPos.match(/###/g);
-    if (tripleHashMatches && tripleHashMatches.length % 2 === 1) {
-        return true;
+    // Check for coffee-style comments only if the option is enabled.
+    // We default to `true` (if config is not yet present) to avoid race conditions
+    // on startup, where a completion request could arrive before the config.
+    const options = getCivetParseOptions();
+    const coffeeCommentEnabled = options?.coffeeComment !== false;
+
+    if (coffeeCommentEnabled) {
+        // --- Civet/CoffeeScript single-hash line comment (# …) -------------------
+        // This logic mirrors the TextMate grammar's 'hash_comment' rule.
+        const hashIndex = (() => {
+            const idx = linePrefix.lastIndexOf('#');
+            if (idx === -1) {
+                return -1;
+            }
+            const charBefore = idx === 0 ? '' : linePrefix[idx - 1];
+            if (charBefore !== '' && !/\s/.test(charBefore)) {
+                return -1; // not preceded by whitespace/start -> not a comment
+            }
+            return idx;
+        })();
+
+        if (hashIndex !== -1) {
+            // Check for `object.#private` private field syntax.
+            const absoluteHashIndex = civetTag.start + lineStartIdx + hashIndex;
+            if (absoluteHashIndex > 0 && text[absoluteHashIndex - 1] === '.') {
+                // This is a private field, not a comment. Fall through.
+            } else {
+                // It's not `.#`, now check it's not another construct like interpolation.
+                const afterHash = linePrefix.substring(hashIndex + 1);
+                if (!/^(?:\{|##|\s*\/|\s*\])/.test(afterHash)) {
+                    return true; // It's a valid line comment.
+                }
+            }
+        }
+
+        // --- Civet/CoffeeScript triple-hash block comment (### ... ###) ---------
+        const tripleHashMatches = scriptContentUpToPos.match(/###/g);
+        if (tripleHashMatches && tripleHashMatches.length % 2 === 1) {
+            return true;
+        }
     }
 
     return false;
