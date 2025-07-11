@@ -35,7 +35,8 @@ import { addFindFileReferencesListener } from './typescript/findFileReferences';
 import { setupSvelteKit } from './sveltekit';
 import { resolveCodeLensMiddleware } from './middlewares';
 
-type RegenFn = (targetPath?: string) => Promise<boolean>;
+// Updated signature: returns info object, optional showOutput flag
+type RegenFn = (showOutput?: boolean) => Promise<{ modified: boolean; parseOptions?: any }>;
 
 namespace TagCloseRequest {
     export const type: RequestType<TextDocumentPositionParams, string, any> = new RequestType(
@@ -279,30 +280,16 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
     );
 
     async function syncCivetConfigAndRestartLS(restartServer: boolean = true) {
+        let parseOptionsResult: { parseOptions?: any } | undefined;
         // Dynamically obtain regenerateTextmate from Civet extension if present
         try {
             const civetExt = extensions.getExtension('DanielX.civet');
             if (civetExt) {
                 await civetExt.activate();
-                const regen: RegenFn | undefined = (civetExt.exports
-                    ? civetExt.exports.regenerateTextmate
-                    : undefined) as RegenFn | undefined;
+                const regen: RegenFn | undefined = (civetExt.exports?.regenerateTextmate as RegenFn) ?? undefined;
 
                 if (typeof regen === 'function') {
-                    const targetGrammar = path.join(
-                        context.extensionPath,
-                        'syntaxes',
-                        'civet.tmLanguage.json'
-                    );
-
-                    // ensure folder exists (packaged extension always has it)
-                    try {
-                        if (!fs.existsSync(path.dirname(targetGrammar))) {
-                            fs.mkdirSync(path.dirname(targetGrammar), { recursive: true });
-                        }
-                    } catch {}
-
-                    var parseOptionsResult = (await regen(targetGrammar)) as any;
+                    parseOptionsResult = await regen(false);
                 }
             }
         } catch (err) {
