@@ -458,12 +458,12 @@ export function isInCivetComment(position: Position, document: Document): boolea
                 }
             }
         }
+    }
 
-        // --- Civet/CoffeeScript triple-hash block comment (### ... ###) ---------
-        const tripleHashMatches = scriptContentUpToPos.match(/###/g);
-        if (tripleHashMatches && tripleHashMatches.length % 2 === 1) {
-            return true;
-        }
+    // --- Civet/CoffeeScript triple-hash block comment (### ... ###) ---------
+    const tripleHashMatches = scriptContentUpToPos.match(/###/g);
+    if (tripleHashMatches && tripleHashMatches.length % 2 === 1) {
+        return true;
     }
 
     return false;
