@@ -3,6 +3,7 @@ import { convertHtmlxToJsx, TemplateProcessResult } from '../htmlxtojsx_v2';
 import { parseHtmlx } from '../utils/htmlxparser';
 import { addComponentExport } from './addComponentExport';
 import { createRenderFunction } from './createRenderFunction';
+import { createCivetProcessor } from './civet';
 import { ExportedNames } from './nodes/ExportedNames';
 import { Generics } from './nodes/Generics';
 import { ImplicitStoreValues } from './nodes/ImplicitStoreValues';
@@ -45,10 +46,21 @@ export function svelte2tsx(
 ) {
     options.mode = options.mode || 'ts';
     options.version = options.version || VERSION;
-
-    const str = new MagicString(svelte);
-    const basename = path.basename(options.filename || '');
     const svelte5Plus = Number(options.version![0]) > 4;
+
+    const preprocessCivetIfPresent = createCivetProcessor(
+        svelte,
+        options.filename,
+        svelte5Plus,
+        options.parse || parse
+    );
+
+    const preprocessorResult = preprocessCivetIfPresent?.preprocess();
+    const civetTransformations = preprocessorResult?.transformations;
+    const processedCode = preprocessorResult?.code ?? svelte;
+
+    const str = new MagicString(processedCode);
+    const basename = path.basename(options.filename || '');
     const isTsFile = options?.isTsFile;
 
     // process the htmlx as a svelte template
@@ -253,9 +265,15 @@ export function svelte2tsx(
         };
     } else {
         str.prepend('///<reference types="svelte" />\n');
+        let sourcemap = str.generateMap({ hires: true, source: options?.filename });
+
+        if (civetTransformations && preprocessCivetIfPresent) {
+            sourcemap = preprocessCivetIfPresent.chainSourceMap(sourcemap, civetTransformations);
+        }
+
         return {
             code: str.toString(),
-            map: str.generateMap({ hires: true, source: options?.filename }),
+            map: sourcemap,
             exportedNames: exportedNames.getExportsMap(),
             events: events.createAPI(),
             // not part of the public API so people don't start using it
