@@ -7,6 +7,7 @@ import { offsetToPosition } from './string';
 import { loadCompileOpts } from '../config';
 import type { ProcessResult as ProcessResultType, CompileResult, Transformation } from '../types';
 import { countLogicalLines } from '../chainer/coordinates';
+import { polishMap } from './map-polisher';
 
 export type { ProcessResultType as ProcessResult };
 
@@ -88,6 +89,9 @@ export function preprocessCivet(
           continue;
       }
 
+      // --- NEW: Polish the sourcemap ---
+      const polishedMap = polishMap(civetMap, contentForCompiler, tsCode);
+
       // Compute line offset for snippet within the Svelte file dynamically by finding first content line
       const civetContentStartLine = getActualContentStartLine(svelteCode, start);
 
@@ -118,7 +122,7 @@ export function preprocessCivet(
       const transformation: Transformation = {
         sourceRange: { start, end },
         outputRange: { start: blockStartInOutput, end: blockStartInOutput + finalTsCode.length },
-        map: civetMap,
+        map: polishedMap, // Use the polished map
         sourceLineCount: civetLineCount,
         outputLineCount: finalTsLineCount,
         sourceStartLine: civetContentStartLine,
