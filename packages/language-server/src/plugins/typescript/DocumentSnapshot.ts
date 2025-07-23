@@ -30,6 +30,8 @@ import { dirname, resolve } from 'path';
 import { URI } from 'vscode-uri';
 import { surroundWithIgnoreComments } from './features/utils';
 import { configLoader } from '../../lib/documents/configLoader';
+import { CivetMapper } from '../civet/CivetMap';
+import { civetLog } from '../civet/logger';
 
 /**
  * An error which occurred while trying to parse/preprocess the svelte file contents.
@@ -220,6 +222,12 @@ function preprocessSvelteFile(document: Document, options: SvelteSnapshotOptions
         htmlAst = (tsx as any).htmlAst;
 
         if (tsxMap) {
+            if (document.getFilePath()?.includes('civet')) {
+                console.log('--- DocumentSnapshot (preprocessSvelteFile) ---');
+                console.log('File:', document.getFilePath());
+                console.log('Received tsxMap from svelte2tsx:\n', JSON.stringify(tsxMap, null, 2));
+                console.log('-------------------------------------------');
+            }
             tsxMap.sources = [document.uri];
 
             const scriptInfo = document.scriptInfo || document.moduleScriptInfo;
@@ -417,8 +425,32 @@ export class SvelteDocumentSnapshot implements DocumentSnapshot {
             return new FragmentMapper(this.parent.getText(), scriptInfo, this.url);
         }
 
+        const isCivet = this.parent.getLanguageAttribute('script') === 'civet';
+        if (isCivet) {
+            // This is a Svelte file with <script lang="civet">
+            // Use our dedicated mapper with legacy heuristics.
+            // It expects the raw sourcemap object, not a TraceMap instance.
+            civetLog(
+                'DocumentSnapshot.ts',
+                466,
+                'Creating CivetMapper for file:',
+                this.parent.getFilePath()
+            );
+            // Filter out null values from sources and sourcesContent
+            const filteredMap = {
+                ...this.tsxMap,
+                sources: this.tsxMap.sources.filter((s): s is string => !!s),
+                sourcesContent: this.tsxMap.sourcesContent?.filter((s): s is string => !!s)
+            };
+            return new CivetMapper(
+                filteredMap,
+                this.url,
+                this.nrPrependedLines
+            );
+        }
+
         return new ConsumerDocumentMapper(
-            new TraceMap(this.tsxMap),
+            new TraceMap(this.tsxMap, this.parent.getFilePath() || ''),
             this.url,
             this.nrPrependedLines
         );
