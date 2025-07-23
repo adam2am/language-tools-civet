@@ -30,7 +30,7 @@ import { dirname, resolve } from 'path';
 import { URI } from 'vscode-uri';
 import { surroundWithIgnoreComments } from './features/utils';
 import { configLoader } from '../../lib/documents/configLoader';
-import { CivetMapper } from '../civet/CivetMap';
+import { CivetMapper } from '../civet/CivetMapper';
 import { civetLog } from '../civet/logger';
 
 /**
