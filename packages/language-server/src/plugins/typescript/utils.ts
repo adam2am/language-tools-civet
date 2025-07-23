@@ -57,6 +57,8 @@ export function getScriptKindFromAttributes(
         case 'typescript':
         case 'text/ts':
         case 'text/typescript':
+        case 'civet':
+        case 'text/civet':
             return ts.ScriptKind.TSX;
         case 'javascript':
         case 'text/javascript':
