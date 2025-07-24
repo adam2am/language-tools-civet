@@ -354,11 +354,24 @@ export function polishMap(
                 if (seg.length === 1) {
                     const genCol = seg[0];
 
-                    // Gatekeeper Pass (The "Bouncer") - Now with a precise whitelist.
+                    // Enhanced Gatekeeper logging
                     const token = tsLines[genLine]?.slice(genCol).match(/^\w+/)?.[0];
-                    if (token && !idWhitelist.has(token)) {
-                        logPM('*PM03*', `[Gatekeeper] Token "${token}" not in whitelist. Skipping mapping. (genLine ${genLine+1}, genCol ${genCol})`);
-                        continue; // This is a compiler-generated artifact, do not map it.
+                    if (token) {
+                        logPM('*GATE1*',
+                            `[Gatekeeper] Found token "${token}" at ${genLine+1}:${genCol}` +
+                            `\n    Context: "${tsLines[genLine].slice(Math.max(0, genCol-10), genCol)}►${tsLines[genLine][genCol]}◄${tsLines[genLine].slice(genCol+1, genCol+11)}"` +
+                            `\n    In whitelist: ${idWhitelist.has(token)}`
+                        );
+
+                        if (!idWhitelist.has(token)) {
+                            logPM('*GATE2*', `[Gatekeeper] Token "${token}" not in whitelist. Skipping mapping.`);
+                            continue; // This is a compiler-generated artifact, do not map it.
+                        }
+                    } else {
+                        logPM('*GATE3*',
+                            `[Gatekeeper] No token at ${genLine+1}:${genCol}, found '${tsLines[genLine][genCol]}'` +
+                            `\n    Context: "${tsLines[genLine].slice(Math.max(0, genCol-10), genCol)}►${tsLines[genLine][genCol]}◄${tsLines[genLine].slice(genCol+1, genCol+11)}"`
+                        );
                     }
 
                     logPM('*PM04*', `[Unmapped] Found unmapped segment at genLine ${genLine+1}, genCol ${genCol}. Attempting to polish.`);
@@ -377,7 +390,15 @@ export function polishMap(
                     } else {
                         // Heuristic fallback
                         logPM('*PM06*', `[TraceMap] Precise mapping failed. Falling back to heuristics.`);
-                        const heu = findHeuristicMapping(genLine, genCol, decoded, tsLines, sanitizedCivetLines, tokenIndex);
+                        const heu = findHeuristicMapping(
+                            genLine,
+                            genCol,
+                            decoded,
+                            tsLines,
+                            sanitizedCivetLines,
+                            tokenIndex,
+                            idWhitelist
+                        );
                         if (heu) {
                             logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
                             const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
@@ -417,25 +438,30 @@ function findHeuristicMapping(
     decoded: DecodedMap,
     tsLines: string[],
     sanitizedCivetLines: string[],
-    tokenIndex: { text: string; col: number }[][]
+    tokenIndex: { text: string; col: number }[][],
+    idWhitelist: Set<string>  // Add whitelist as parameter
 ): { line: number; column: number } | null {
-    logPM('*PM13*', `[findHeuristicMapping] Entered for genLine ${genLine+1}, genCol ${genCol}`);
     const tsLine = tsLines[genLine];
     if (!tsLine) return null;
 
-    // Heuristic 1: Find the token at the generated position and search for it in the original code.
-    const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
-    logPM('*PM14*', `[Heuristic 1] Searching for token "${token}" from generated line ${genLine+1}.`);
+    // Add context logging for what we're looking at
+    const char_at_pos = tsLine[genCol];
+    const next_5_chars = tsLine.slice(genCol, genCol + 5);
+    logPM('*CTX*', `[Context] Character at ${genLine+1}:${genCol} is '${char_at_pos}', next few chars: "${next_5_chars}"`);
 
+    // Heuristic 1: Find the token at the generated position
+    const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
+    
     if (token) {
+        logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position. In whitelist: ${idWhitelist.has(token)}`);
         // A token exists at this position. We MUST find it in the source.
         // If we can't, it's a generated token and we should NOT map it.
-        // Use a regex to ensure we match the whole word, not a substring
-        // Pre-built tokenIndex makes regex unnecessary but keep log for parity
         logPM('*MP09*', `[Heuristic 1] Using tokenIndex search for "${token}"`);
 
         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
         if (surroundingMapping) {
+            // Log the context of where we're searching
+            logPM('*SRCH*', `[Search Context] Looking near original line ${surroundingMapping.originalLine+1}, which maps to generated col ${surroundingMapping.generatedColumn}`);
             const searchLine = surroundingMapping.originalLine;
             const searchRadius = 5; // TODO: use SEARCH_RADIUS const
             logPM('*PM15*', `[Heuristic 1a] Found surrounding mapping. Searching for token near original line ${searchLine + 1} (radius: ${searchRadius}).`);
@@ -471,18 +497,77 @@ function findHeuristicMapping(
         // It's a compiler-generated artifact. Return null to prevent a phantom mapping.
         logPM('*MP12*', `[Heuristic 1] FAILED. Token "${token}" found in generated code but not in sanitized source. Aborting mapping.`);
         return null;
-    }
+    } else {
+        // Enhanced artifact detection for non-token characters
+        logPM('*ART0*', `[Artifact Analysis] Starting check for '${char_at_pos}' at ${genLine+1}:${genCol}`);
+        
+        // Look backwards for previous token
+        const beforeText = tsLine.slice(0, genCol);
+        const prevMatch = beforeText.match(/(\w+)\W*$/);
+        const prevToken = prevMatch?.[1];
+        const prevTokenIsInWhitelist = prevToken ? idWhitelist.has(prevToken) : true;
+        
+        if (prevToken) {
+            logPM('*ART1*', 
+                `[Artifact Check] Found previous token "${prevToken}"` +
+                `\n    Distance: ${genCol - (beforeText.lastIndexOf(prevToken) ?? 0)}` +
+                `\n    In whitelist: ${prevTokenIsInWhitelist}`
+            );
+        }
 
-    // Heuristic 2: This code path now only runs if there was NO token at the position (e.g., symbols, whitespace).
-    // It's safe to use interpolation here.
-    logPM('*PM20*', `[Heuristic 2] No token found. Looking for previous mapping on same generated line to interpolate.`);
-    const mapping = findLastMappingOnLineBefore(genLine, genCol, decoded);
-    if (mapping) {
-        // Interpolation: apply the column delta from the last mapping
-        const delta = genCol - mapping.generatedColumn;
-        const newColumn = mapping.originalColumn + delta;
-        logPM('*PM21*', `[Heuristic 2] Found previous mapping. Interpolating: original col ${mapping.originalColumn} + delta ${delta} = new col ${newColumn}`);
-        return { line: mapping.originalLine, column: newColumn };
+        // Look forwards for next token
+        const afterText = tsLine.slice(genCol + 1);
+        const nextMatch = afterText.match(/^[\W]*(\w+)/);
+        const nextToken = nextMatch?.[1];
+        const nextTokenIsInWhitelist = nextToken ? idWhitelist.has(nextToken) : true;
+        
+        if (nextToken) {
+            logPM('*ART2*', 
+                `[Artifact Check] Found next token "${nextToken}"` +
+                `\n    Distance: ${(afterText.indexOf(nextToken) ?? 0) + 1}` +
+                `\n    In whitelist: ${nextTokenIsInWhitelist}`
+            );
+        }
+
+        // --- NEW: Artifact Guard Logic ---
+        // If we're adjacent to a compiler artifact (non-whitelisted token),
+        // do not attempt to map this punctuation/whitespace.
+        if (!prevTokenIsInWhitelist || !nextTokenIsInWhitelist) {
+            logPM('*ART3*', 
+                `[Artifact Guard] Blocking interpolation for '${char_at_pos}'` +
+                `\n    Context: "${tsLine.slice(Math.max(0, genCol-15), genCol)}►${char_at_pos}◄${tsLine.slice(genCol+1, genCol+16)}"` +
+                `\n    Reason: Adjacent to compiler artifact(s):` +
+                (prevToken && !prevTokenIsInWhitelist ? `\n      - Before: "${prevToken}"` : '') +
+                (nextToken && !nextTokenIsInWhitelist ? `\n      - After: "${nextToken}"` : '')
+            );
+            return null;
+        }
+
+        // Only proceed with interpolation if we're not adjacent to artifacts
+        logPM('*PM20*', 
+            `[Heuristic 2] No token at '${char_at_pos}'. Proceeding with interpolation.` +
+            `\n    Context is clean (not adjacent to compiler artifacts)`
+        );
+        
+        const mapping = findLastMappingOnLineBefore(genLine, genCol, decoded);
+        if (mapping) {
+            // Interpolation: apply the column delta from the last mapping
+            const delta = genCol - mapping.generatedColumn;
+            const newColumn = mapping.originalColumn + delta;
+            
+            // Log successful interpolation
+            logPM('*PM21*', 
+                `[Heuristic 2] Creating interpolated mapping` +
+                `\n    Character: '${char_at_pos}'` +
+                `\n    Context: "${tsLine.slice(Math.max(0, genCol-10), genCol)}►${char_at_pos}◄${tsLine.slice(genCol+1, genCol+11)}"` +
+                `\n    Previous token (safe): ${prevToken || 'none'}` +
+                `\n    Next token (safe): ${nextToken || 'none'}` +
+                `\n    Delta: ${delta} (from gen ${mapping.generatedColumn} to ${genCol})` +
+                `\n    New column: ${newColumn}`
+            );
+
+            return { line: mapping.originalLine, column: newColumn };
+        }
     }
     logPM('*PM22*', `[Heuristic] All heuristics failed for genLine ${genLine+1}, genCol ${genCol}`);
     return null;
@@ -508,7 +593,7 @@ function findLastMappingOnLineBefore(line: number, column: number, decoded: Deco
         }
     }
     return lastMapping;
-} 
+}
 
 function findFirstMappingOnLineAfter(line: number, column: number, decoded: DecodedMap) {
     const lineMappings = decoded[line];
