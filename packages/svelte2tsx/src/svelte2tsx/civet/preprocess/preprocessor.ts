@@ -90,7 +90,7 @@ export function preprocessCivet(
       }
 
       // --- NEW: Polish the sourcemap ---
-      const polishedMap = polishMap(civetMap, contentForCompiler, tsCode);
+      const polishedMap = polishMap(civetMap, contentForCompiler, tsCode, civetCompileOptions);
 
       // Compute line offset for snippet within the Svelte file dynamically by finding first content line
       const civetContentStartLine = getActualContentStartLine(svelteCode, start);

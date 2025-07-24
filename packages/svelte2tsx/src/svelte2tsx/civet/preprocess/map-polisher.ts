@@ -64,13 +64,18 @@ function getSanitizedLines(civetCode: string): string[] {
         }
     };
 
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, text);
+    const scanner = ts.createScanner(
+        ts.ScriptTarget.Latest, 
+        /*skipTrivia*/ true, 
+        ts.LanguageVariant.Standard, 
+        text);
+
     while (true) {
         const token = scanner.scan();
         if (token === ts.SyntaxKind.EndOfFileToken) break;
 
-        const start = scanner.getTokenPos();
-        const end = scanner.getTextPos();
+        const start = scanner.getTokenStart();
+        const end = scanner.getTokenEnd();
 
         switch (token) {
             case ts.SyntaxKind.SingleLineCommentTrivia:
@@ -193,12 +198,28 @@ function withStringHelpers<T extends { file?: string }>(map: T): T & { file: str
  * "return" or "if" originating from user code are still whitelisted. This
  * avoids the fragile Unicode-heavy regex we used before.
  */
-function buildIdentifierWhitelist(src: string): Set<string> {
+function buildIdentifierWhitelist(src: string, sourceMask: CommentMask): Set<string> {
     const ids = new Set<string>();
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, src);
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
+    const lines = src.split('\\n');
+    let line = 0;
+    let lineStart = 0;
     while (true) {
         const token = scanner.scan();
         if (token === ts.SyntaxKind.EndOfFileToken) break;
+
+        const pos = scanner.getTokenPos();
+        while (pos >= lineStart + lines[line].length + 1) {
+            lineStart += lines[line].length + 1;
+            line++;
+        }
+        const col = pos - lineStart;
+
+        // THE CRUCIAL GUARD: If the token is inside a source comment, skip it.
+        if (sourceMask.isComment(line, col)) {
+            continue;
+        }
+
         if (token === ts.SyntaxKind.Identifier) {
             ids.add(scanner.getTokenText());
         } else if (token === ts.SyntaxKind.NumericLiteral) {
@@ -302,7 +323,8 @@ export function remapRange(range: Range, sourcemapLines?: SourcemapLines): Range
 export function polishMap(
     rawMap: SourceMap,
     civetCode: string,
-    tsCode: string
+    tsCode: string,
+    civetCompileOptions: Record<string, any>
 ) {
     if (typeof rawMap.mappings !== 'string' || !rawMap.mappings) {
         logPM('*PM00*', '[polishMap] No mappings string present, returning rawMap');
@@ -329,6 +351,8 @@ export function polishMap(
         }
         // --- End of Bailout Logic ---
 
+        const generatedMask = CommentMask.fromTypeScript(tsCode);
+        const sourceMask = CommentMask.fromCivet(civetCode, civetCompileOptions);
         const tracer = new TraceMap(rawMap);
         const tsLines = tsCode.split('\n');
         const sourceFile = getOrCreateSourceFile(tsCode);
@@ -349,7 +373,7 @@ export function polishMap(
         });
 
         // Step 1: Build whitelist with scanner so identifiers inside comments/strings are ignored
-        const idWhitelist = buildIdentifierWhitelist(civetCode);
+        const idWhitelist = buildIdentifierWhitelist(civetCode, sourceMask);
         logPM('*PM01*', `[Whitelist] Built from sanitized source (${idWhitelist.size} ids): ${Array.from(idWhitelist).join(', ')}`);
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
@@ -360,6 +384,14 @@ export function polishMap(
                 // If a segment has no source mapping, try to find one.
                 if (seg.length === 1) {
                     const genCol = seg[0];
+
+                    // --- NEW: Primary Guard ---
+                    // If the segment is inside a comment in the *generated* code, it's an
+                    // unmappable artifact. Skip it before any other logic.
+                    if (generatedMask.isComment(genLine, genCol)) {
+                        logPM('*GEN-GUARD*', `[Generated Guard] Blocking mapping for segment inside a TS comment at ${genLine+1}:${genCol}`);
+                        continue;
+                    }
 
                     // Enhanced Gatekeeper logging
                     const token = tsLines[genLine]?.slice(genCol).match(/^\w+/)?.[0];
@@ -372,7 +404,7 @@ export function polishMap(
 
                         if (!idWhitelist.has(token)) {
                             logPM('*GATE2*', `[Gatekeeper] Token "${token}" not in whitelist. Skipping mapping.`);
-                            continue; // This is a compiler-generated artifact, do not map it.
+                        continue; // This is a compiler-generated artifact, do not map it.
                         }
                     } else {
                         logPM('*GATE3*',
@@ -385,42 +417,51 @@ export function polishMap(
                     const pos = originalPositionFor(tracer, { line: genLine + 1, column: genCol });
 
                     if (pos.line !== null && pos.column !== null && pos.source !== null) {
-                        // Found a precise mapping, create a new segment
-                        logPM('*PM05*', `[TraceMap] Precise mapping found: original line ${pos.line}, col ${pos.column}`);
-                        const newSeg: [number, number, number, number] = [
-                            seg[0],
-                            rawMap.sources.indexOf(pos.source),
-                            pos.line - 1,
-                            pos.column
-                        ];
+                        // --- NEW: Source Guard for TraceMap ---
+                        // Verify that the mapping from TraceMap doesn't land in a source comment.
+                        if (sourceMask.isComment(pos.line - 1, pos.column)) {
+                            logPM('*SRC-GUARD*', `[Source Guard] TraceMap result for ${genLine+1}:${genCol} rejected. Lands in source comment at ${pos.line}:${pos.column}.`);
+                            // Fall through to heuristics
+                        } else {
+                            // Found a valid, precise mapping, create a new segment
+                            logPM('*PM05*', `[TraceMap] Precise mapping found: original line ${pos.line}, col ${pos.column}`);
+                            const newSeg: [number, number, number, number] = [
+                                seg[0],
+                                rawMap.sources.indexOf(pos.source),
+                                pos.line - 1,
+                                pos.column
+                            ];
+                            line[i] = newSeg;
+                            continue; // Skip to next segment
+                        }
+                    }
+
+                    // Heuristic fallback
+                    logPM('*PM06*', `[TraceMap] Precise mapping failed or was rejected. Falling back to heuristics.`);
+                    const heu = findHeuristicMapping(
+                        genLine,
+                        genCol,
+                        decoded,
+                        tsLines,
+                        sanitizedCivetLines,
+                        tokenIndex,
+                        idWhitelist,
+                        sourceMask // Pass the source mask
+                    );
+                    if (heu) {
+                        logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
+                        const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
                         line[i] = newSeg;
                     } else {
-                        // Heuristic fallback
-                        logPM('*PM06*', `[TraceMap] Precise mapping failed. Falling back to heuristics.`);
-                        const heu = findHeuristicMapping(
-                            genLine,
-                            genCol,
-                            decoded,
-                            tsLines,
-                            sanitizedCivetLines,
-                            tokenIndex,
-                            idWhitelist
-                        );
-                        if (heu) {
-                            logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
-                            const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
+                        // Deep-dive using TypeScript AST as a last resort
+                        logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
+                        const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines);
+                        if (ast) {
+                            logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
+                            const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
                             line[i] = newSeg;
                         } else {
-                            // Deep-dive using TypeScript AST as a last resort
-                            logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
-                            const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines);
-                            if (ast) {
-                                logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
-                                const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
-                                line[i] = newSeg;
-                            } else {
-                                logPM('*PM10*', `[AST] Fallback failed: No mapping found for genLine ${genLine+1}, genCol ${genCol}`);
-                            }
+                            logPM('*PM10*', `[AST] Fallback failed: No mapping found for genLine ${genLine+1}, genCol ${genCol}`);
                         }
                     }
                 }
@@ -446,7 +487,8 @@ function findHeuristicMapping(
     tsLines: string[],
     sanitizedCivetLines: string[],
     tokenIndex: { text: string; col: number }[][],
-    idWhitelist: Set<string>  // Add whitelist as parameter
+    idWhitelist: Set<string>,  // Add whitelist as parameter
+    sourceMask: CommentMask // Add sourceMask as parameter
 ): { line: number; column: number } | null {
     const tsLine = tsLines[genLine];
     if (!tsLine) return null;
@@ -458,7 +500,7 @@ function findHeuristicMapping(
 
     // Heuristic 1: Find the token at the generated position
     const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
-    
+
     if (token) {
         logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position. In whitelist: ${idWhitelist.has(token)}`);
         // A token exists at this position. We MUST find it in the source.
@@ -477,16 +519,26 @@ function findHeuristicMapping(
                 if (upLine >= 0) {
                     const tokPos = tokenIndex[upLine].find(t => t.text === token);
                     if (tokPos) {
-                        logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${upLine+1}, col ${tokPos.col}.`);
-                        return { line: upLine, column: tokPos.col };
+                        // --- NEW: Source Guard for Heuristics ---
+                        if (sourceMask.isComment(upLine, tokPos.col)) {
+                            logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${upLine+1}:${tokPos.col}.`);
+                        } else {
+                            logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${upLine+1}, col ${tokPos.col}.`);
+                            return { line: upLine, column: tokPos.col };
+                        }
                     }
                 }
                 const downLine = searchLine + i;
                 if (i > 0 && downLine < sanitizedCivetLines.length) {
                     const tokPos = tokenIndex[downLine].find(t => t.text === token);
                     if (tokPos) {
-                        logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${tokPos.col}.`);
-                        return { line: downLine, column: tokPos.col };
+                        // --- NEW: Source Guard for Heuristics ---
+                        if (sourceMask.isComment(downLine, tokPos.col)) {
+                             logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${downLine+1}:${tokPos.col}.`);
+                        } else {
+                            logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${tokPos.col}.`);
+                            return { line: downLine, column: tokPos.col };
+                        }
                     }
                 }
             }
@@ -495,6 +547,11 @@ function findHeuristicMapping(
         for (let i = 0; i < sanitizedCivetLines.length; i++) {
             const tokPos = tokenIndex[i].find(t => t.text === token);
             if (tokPos) {
+                 // --- NEW: Source Guard for Heuristics ---
+                if (sourceMask.isComment(i, tokPos.col)) {
+                    logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${i+1}:${tokPos.col}.`);
+                    continue; // Check next line
+                }
                 logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${tokPos.col}.`);
                 return { line: i, column: tokPos.col };
             }
@@ -600,7 +657,7 @@ function findLastMappingOnLineBefore(line: number, column: number, decoded: Deco
         }
     }
     return lastMapping;
-}
+} 
 
 function findFirstMappingOnLineAfter(line: number, column: number, decoded: DecodedMap) {
     const lineMappings = decoded[line];
@@ -618,4 +675,95 @@ function findFirstMappingOnLineAfter(line: number, column: number, decoded: Deco
         }
     }
     return null;
+} 
+
+/**
+ * A utility to quickly check if a given position in a source file is inside a comment.
+ * This is used to prevent mapping to/from comments.
+ */
+class CommentMask {
+    // A set of strings, where each string is "line:startCol:endCol"
+    private commentSpans = new Map<number, { start: number; end: number }[]>();
+
+    private constructor() {}
+
+    /**
+     * Checks if the given line/column position is inside a known comment span.
+     */
+    isComment(line: number, col: number): boolean {
+        const lineSpans = this.commentSpans.get(line);
+        if (!lineSpans) return false;
+        return lineSpans.some(span => col >= span.start && col < span.end);
+    }
+
+    /**
+     * Creates a mask by parsing TypeScript source and identifying all comment trivia.
+     */
+    static fromTypeScript(tsCode: string): CommentMask {
+        const mask = new CommentMask();
+        const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, tsCode);
+        const lines = tsCode.split('\n');
+
+        while (true) {
+            const token = scanner.scan();
+            if (token === ts.SyntaxKind.EndOfFileToken) break;
+
+            if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) {
+                const start = scanner.getTokenPos();
+                const end = scanner.getTextPos();
+                const startLine = lines.findIndex((_, i) => tsCode.length - lines.slice(i + 1).join('\n').length - 1 > start);
+                const endLine = lines.findIndex((_, i) => tsCode.length - lines.slice(i + 1).join('\n').length - 1 > end);
+                
+                for (let line = startLine; line <= endLine; line++) {
+                    const lineStartPos = tsCode.length - lines.slice(line).join('\n').length - 1;
+                    
+                    const spanStart = (line === startLine) ? start - lineStartPos : 0;
+                    const spanEnd = (line === endLine) ? end - lineStartPos : lines[line].length;
+                    
+                    if (!mask.commentSpans.has(line)) {
+                        mask.commentSpans.set(line, []);
+                    }
+                    mask.commentSpans.get(line)!.push({ start: spanStart, end: spanEnd });
+                }
+            }
+        }
+        return mask;
+    }
+
+    /**
+     * Creates a mask by parsing Civet source and identifying all comments.
+     * It correctly ignores comment characters that appear inside string literals.
+     * It uses the provided compile options to determine the correct comment syntax.
+     */
+    static fromCivet(civetCode: string, options: Record<string, any>): CommentMask {
+        const mask = new CommentMask();
+        const lines = civetCode.split('\n');
+        const coffeeComments = options.parseOptions?.coffeeComments ?? true;
+        const commentChar = coffeeComments ? '#' : '//';
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            let inString: false | "'" | '"' | '`' = false;
+            for (let j = 0; j < line.length; j++) {
+                const char = line[j];
+
+                if (inString) {
+                    // Check for end of string, ignoring escaped quotes
+                    if (char === inString && line[j - 1] !== '\\') {
+                        inString = false;
+                    }
+                } else {
+                    // Check for start of string
+                    if (char === "'" || char === '"' || char === '`') {
+                        inString = char;
+                    } else if (line.startsWith(commentChar, j)) {
+                        // We found a comment, mark the rest of the line
+                        mask.commentSpans.set(i, [{ start: j, end: line.length }]);
+                        break; // Move to next line
+                    }
+                }
+            }
+        }
+        return mask;
+    }
 } 
