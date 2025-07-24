@@ -142,7 +142,8 @@ function findAstGuidedMapping(
     genCol: number,
     decoded: DecodedMap,
     sourceFile: ts.SourceFile,
-    sanitizedCivetLines: string[] // Now required
+    sanitizedCivetLines: string[], // Now required
+    sourceMask: CommentMask
 ) {
     const ident = identifierAt(sourceFile, genLine, genCol);
     if (!ident) return null;
@@ -158,12 +159,24 @@ function findAstGuidedMapping(
             const up = hint.originalLine - i;
             if (up >= 0) {
                 const col = sanitizedCivetLines[up].indexOf(ident);
-                if (col !== -1) return { line: up, column: col };
+                if (col !== -1) {
+                    if (sourceMask.isComment(up, col)) {
+                        logPM('*SRC-GUARD*', `[Source Guard] AST result for "${ident}" rejected. Lands in source comment at ${up+1}:${col}.`);
+                    } else {
+                        return { line: up, column: col };
+                    }
+                }
             }
             const down = hint.originalLine + i;
             if (i && down < sanitizedCivetLines.length) {
                 const col = sanitizedCivetLines[down].indexOf(ident);
-                if (col !== -1) return { line: down, column: col };
+                if (col !== -1) {
+                    if (sourceMask.isComment(down, col)) {
+                        logPM('*SRC-GUARD*', `[Source Guard] AST result for "${ident}" rejected. Lands in source comment at ${down+1}:${col}.`);
+                    } else {
+                        return { line: down, column: col };
+                    }
+                }
             }
         }
     }
@@ -172,7 +185,13 @@ function findAstGuidedMapping(
     logPM('*MP11*', `[AST] Hint-based search failed for "${ident}". Doing global search.`);
     for (let i = 0; i < sanitizedCivetLines.length; i++) {
         const col = sanitizedCivetLines[i].indexOf(ident);
-        if (col !== -1) return { line: i, column: col };
+        if (col !== -1) {
+            if (sourceMask.isComment(i, col)) {
+                logPM('*SRC-GUARD*', `[Source Guard] AST result for "${ident}" rejected. Lands in source comment at ${i+1}:${col}.`);
+                continue;
+            }
+            return { line: i, column: col };
+        }
     }
 
     return null;
@@ -204,18 +223,20 @@ function buildIdentifierWhitelist(src: string, sourceMask: CommentMask): Set<str
     const lines = src.split('\\n');
     let line = 0;
     let lineStart = 0;
+    
     while (true) {
         const token = scanner.scan();
         if (token === ts.SyntaxKind.EndOfFileToken) break;
 
-        const pos = scanner.getTokenPos();
-        while (pos >= lineStart + lines[line].length + 1) {
+        const pos = scanner.getTokenStart();
+        // This loop logic is tricky. We need to find the correct line for the current token position.
+        // It's possible for multiple newlines to exist between tokens.
+        while (pos >= lineStart + lines[line].length + 1 && line < lines.length - 1) {
             lineStart += lines[line].length + 1;
             line++;
         }
         const col = pos - lineStart;
-
-        // THE CRUCIAL GUARD: If the token is inside a source comment, skip it.
+        
         if (sourceMask.isComment(line, col)) {
             continue;
         }
@@ -455,7 +476,7 @@ export function polishMap(
                     } else {
                         // Deep-dive using TypeScript AST as a last resort
                         logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
-                        const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines);
+                        const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines, sourceMask);
                         if (ast) {
                             logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
                             const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
@@ -618,6 +639,13 @@ function findHeuristicMapping(
             // Interpolation: apply the column delta from the last mapping
             const delta = genCol - mapping.generatedColumn;
             const newColumn = mapping.originalColumn + delta;
+            const newLine = mapping.originalLine;
+
+            // --- NEW: Source Guard for Interpolation ---
+            if (sourceMask.isComment(newLine, newColumn)) {
+                logPM('*SRC-GUARD*', `[Source Guard] Interpolation result rejected. Lands in source comment at ${newLine+1}:${newColumn}.`);
+                return null;
+            }
             
             // Log successful interpolation
             logPM('*PM21*', 
@@ -630,7 +658,7 @@ function findHeuristicMapping(
                 `\n    New column: ${newColumn}`
             );
 
-            return { line: mapping.originalLine, column: newColumn };
+            return { line: newLine, column: newColumn };
         }
     }
     logPM('*PM22*', `[Heuristic] All heuristics failed for genLine ${genLine+1}, genCol ${genCol}`);
