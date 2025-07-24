@@ -426,7 +426,8 @@ export class SvelteDocumentSnapshot implements DocumentSnapshot {
         }
 
         const isCivet = this.parent.getLanguageAttribute('script') === 'civet';
-        if (isCivet) {
+        const turnOnCivet = false;
+        if (isCivet && turnOnCivet) {
             // This is a Svelte file with <script lang="civet">
             // Use our dedicated mapper with legacy heuristics.
             // It expects the raw sourcemap object, not a TraceMap instance.
