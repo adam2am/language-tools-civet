@@ -303,8 +303,26 @@ export function polishMap(
     }
 
     try {
-        const tracer = new TraceMap(rawMap);
         const decoded: DecodedMap = decode(rawMap.mappings);
+
+        // --- Phase 0: File-level Early Bailout ---
+        let unmappedSegmentCount = 0;
+        const HOLE_CHECK_THRESHOLD = 0; // Bail out if 0 holes are found.
+        for (const line of decoded) {
+            for (const seg of line) {
+                if (seg.length === 1) {
+                    unmappedSegmentCount++;
+                }
+            }
+        }
+
+        if (unmappedSegmentCount <= HOLE_CHECK_THRESHOLD) {
+            logPM('*PM-BAILOUT*', `[Bailout] Found ${unmappedSegmentCount} unmapped segments. Skipping polish.`);
+            return withStringHelpers(rawMap);
+        }
+        // --- End of Bailout Logic ---
+
+        const tracer = new TraceMap(rawMap);
         const tsLines = tsCode.split('\n');
         const sourceFile = getOrCreateSourceFile(tsCode);
         const sanitizedCivetLines = getSanitizedLines(civetCode);
