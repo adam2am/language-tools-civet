@@ -20,6 +20,36 @@ type SourceMap = {
 
 // Cache parsed SourceFiles by the *exact* TS code string so we parse once per file.
 const sourceFileCache = new Map<string, ts.SourceFile>();
+const sanitizedSourceCache = new Map<string, string[]>();
+
+/**
+ * Creates a "sanitized" version of the source code where all comments and
+ * string literals are replaced with whitespace. This allows for syntax-unaware
+ * `indexOf` searches without accidentally matching tokens inside non-code contexts.
+ * The result is cached by the original code string.
+ */
+function getSanitizedLines(civetCode: string): string[] {
+    if (sanitizedSourceCache.has(civetCode)) {
+        logPM('*MP06*', '[Sanitizer] Cache HIT');
+        return sanitizedSourceCache.get(civetCode)!;
+    }
+    logPM('*MP07*', '[Sanitizer] Cache MISS, creating sanitized source...');
+
+    // Note: Order of replacement matters. Block comments first.
+    const sanitized = civetCode
+        // Block comments: /* ... */
+        .replace(/\/\*[\s\S]*?\*\//g, match => ' '.repeat(match.length))
+        // Line comments: // ...
+        .replace(/\/\/.*/g, match => ' '.repeat(match.length))
+        // All string literals: `...`, '...', "..." (handles escaped quotes)
+        .replace(/(["'`])(?:\\.|(?!\1).)*\1/gs, match => ' '.repeat(match.length));
+
+    const lines = sanitized.split('\n');
+    sanitizedSourceCache.set(civetCode, lines);
+    logPM('*MP08*', `[Sanitizer] Finished. Source is ${lines.length} lines long.`);
+    return lines;
+}
+
 
 function getOrCreateSourceFile(tsCode: string): ts.SourceFile {
     let sf = sourceFileCache.get(tsCode);
@@ -58,9 +88,9 @@ function identifierAt(sf: ts.SourceFile, line: number, col: number): string | nu
 function findAstGuidedMapping(
     genLine: number,
     genCol: number,
-    civetLines: string[],
     decoded: DecodedMap,
-    sourceFile: ts.SourceFile
+    sourceFile: ts.SourceFile,
+    sanitizedCivetLines: string[] // Now required
 ) {
     const ident = identifierAt(sourceFile, genLine, genCol);
     if (!ident) return null;
@@ -74,20 +104,21 @@ function findAstGuidedMapping(
         for (let i = 0; i <= searchRadius; i++) {
             const up = hint.originalLine - i;
             if (up >= 0) {
-                const col = civetLines[up].indexOf(ident);
+                const col = sanitizedCivetLines[up].indexOf(ident);
                 if (col !== -1) return { line: up, column: col };
             }
             const down = hint.originalLine + i;
-            if (i && down < civetLines.length) {
-                const col = civetLines[down].indexOf(ident);
+            if (i && down < sanitizedCivetLines.length) {
+                const col = sanitizedCivetLines[down].indexOf(ident);
                 if (col !== -1) return { line: down, column: col };
             }
         }
     }
 
     // Fallback: global search (last resort)
-    for (let i = 0; i < civetLines.length; i++) {
-        const col = civetLines[i].indexOf(ident);
+    logPM('*MP11*', `[AST] Hint-based search failed for "${ident}". Doing global search.`);
+    for (let i = 0; i < sanitizedCivetLines.length; i++) {
+        const col = sanitizedCivetLines[i].indexOf(ident);
         if (col !== -1) return { line: i, column: col };
     }
 
@@ -169,7 +200,7 @@ export function remapPosition(position: Position, sourcemapLines?: SourcemapLine
         const [, , srcLine, srcChar] = lastMapping as [number, number, number, number];
         const newChar = srcChar + character - lastMappingPos;
         const mapped: Position = { line: srcLine, character: newChar };
-        logPM('*MP03*', `[remapPosition] Mapped (${line},${character}) -> (${mapped.line},${mapped.character})`);
+        logPM('*MP03*', `[remapPosition] Mapped gen(${line},${character}) -> src(${mapped.line},${mapped.character})`);
         return mapped;
     }
 
@@ -186,7 +217,7 @@ export function remapRange(range: Range, sourcemapLines?: SourcemapLines): Range
         start: remapPosition(range.start, sourcemapLines),
         end: remapPosition(range.end, sourcemapLines)
     };
-    logPM('*MP05*', `[remapRange] Mapped start (${range.start.line},${range.start.character}) and end (${range.end.line},${range.end.character})`);
+    logPM('*MP05*', `[remapRange] Mapped start from src(${range.start.line},${range.start.character}) -> (${mapped.start.line},${mapped.start.character}) and end from src(${range.end.line},${range.end.character}) -> (${mapped.end.line},${mapped.end.character})`);
     return mapped;
 }
 
@@ -210,6 +241,7 @@ export function polishMap(
         const civetLines = civetCode.split('\n');
         const tsLines = tsCode.split('\n');
         const sourceFile = getOrCreateSourceFile(tsCode);
+        const sanitizedCivetLines = getSanitizedLines(civetCode);
 
         // Step 1: Create a whitelist of all valid identifiers from the source code.
         const idWhitelist = new Set(civetCode.match(/(?:[$_]||\p{ID_Start})(?:[$_]||\p{ID_Continue})*/gu) ?? []);
@@ -247,7 +279,7 @@ export function polishMap(
                     } else {
                         // Heuristic fallback
                         logPM('*PM06*', `[TraceMap] Precise mapping failed. Falling back to heuristics.`);
-                        const heu = findHeuristicMapping(genLine, genCol, decoded, civetLines, tsLines);
+                        const heu = findHeuristicMapping(genLine, genCol, decoded, civetLines, tsLines, sanitizedCivetLines);
                         if (heu) {
                             logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
                             const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
@@ -255,7 +287,7 @@ export function polishMap(
                         } else {
                             // Deep-dive using TypeScript AST as a last resort
                             logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
-                            const ast = findAstGuidedMapping(genLine, genCol, civetLines, decoded, sourceFile);
+                            const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines);
                             if (ast) {
                                 logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
                                 const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
@@ -286,7 +318,8 @@ function findHeuristicMapping(
     genCol: number,
     decoded: DecodedMap,
     civetLines: string[],
-    tsLines: string[]
+    tsLines: string[],
+    sanitizedCivetLines: string[] // Now required
 ): { line: number; column: number } | null {
     logPM('*PM13*', `[findHeuristicMapping] Entered for genLine ${genLine+1}, genCol ${genCol}`);
     const tsLine = tsLines[genLine];
@@ -295,7 +328,14 @@ function findHeuristicMapping(
     // Heuristic 1: Find the token at the generated position and search for it in the original code.
     const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
     logPM('*PM14*', `[Heuristic 1] Searching for token "${token}" from generated line ${genLine+1}.`);
+
     if (token) {
+        // A token exists at this position. We MUST find it in the source.
+        // If we can't, it's a generated token and we should NOT map it.
+        // Use a regex to ensure we match the whole word, not a substring
+        const tokenRegex = new RegExp(`\\b${token}\\b`);
+        logPM('*MP09*', `[Heuristic 1] Using regex: ${tokenRegex}`);
+
         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
         if (surroundingMapping) {
             const searchLine = surroundingMapping.originalLine;
@@ -304,33 +344,40 @@ function findHeuristicMapping(
             for (let i = 0; i <= searchRadius; i++) {
                 const upLine = searchLine - i;
                 if (upLine >= 0) {
-                    const col = civetLines[upLine].indexOf(token);
-                    if (col !== -1) {
-                        logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in original code at line ${upLine+1}, col ${col}.`);
-                        return { line: upLine, column: col };
+                    const match = sanitizedCivetLines[upLine].match(tokenRegex);
+                    if (match?.index !== undefined) {
+                        logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${upLine+1}, col ${match.index}.`);
+                        return { line: upLine, column: match.index };
                     }
                 }
                 const downLine = searchLine + i;
                 if (i > 0 && downLine < civetLines.length) {
-                    const col = civetLines[downLine].indexOf(token);
-                    if (col !== -1) {
-                        logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in original code at line ${downLine+1}, col ${col}.`);
-                        return { line: downLine, column: col };
+                    const match = sanitizedCivetLines[downLine].match(tokenRegex);
+                    if (match?.index !== undefined) {
+                        logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${match.index}.`);
+                        return { line: downLine, column: match.index };
                     }
                 }
             }
         }
         logPM('*PM18*', `[Heuristic 1b] No luck with focused search. Falling back to global search.`);
         for (let i = 0; i < civetLines.length; i++) {
-            const col = civetLines[i].indexOf(token);
-            if (col !== -1) {
-                logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in original code at line ${i+1}, col ${col}.`);
-                return { line: i, column: col };
+            const match = sanitizedCivetLines[i].match(tokenRegex);
+            if (match?.index !== undefined) {
+                logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${match.index}.`);
+                return { line: i, column: match.index };
             }
         }
+
+        // IMPORTANT: If we searched for a token and failed to find it, do not proceed.
+        // It's a compiler-generated artifact. Return null to prevent a phantom mapping.
+        logPM('*MP12*', `[Heuristic 1] FAILED. Token "${token}" found in generated code but not in sanitized source. Aborting mapping.`);
+        return null;
     }
-    // Heuristic 2: Find the last valid mapping on the same line and use its source line.
-    logPM('*PM20*', `[Heuristic 2] Token search failed. Looking for previous mapping on same generated line.`);
+
+    // Heuristic 2: This code path now only runs if there was NO token at the position (e.g., symbols, whitespace).
+    // It's safe to use interpolation here.
+    logPM('*PM20*', `[Heuristic 2] No token found. Looking for previous mapping on same generated line to interpolate.`);
     const mapping = findLastMappingOnLineBefore(genLine, genCol, decoded);
     if (mapping) {
         // Interpolation: apply the column delta from the last mapping
