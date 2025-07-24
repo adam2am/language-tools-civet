@@ -145,6 +145,7 @@ export class DiagnosticsProviderImpl implements DiagnosticsProvider {
         const converted: Diagnostic[] = [];
 
         for (const tsDiag of diagnostics) {
+            console.log('[*E1* DiagnosticsProvider.ts:168] Raw TS Diagnostic', { file: tsDoc.filePath, tsDiag });
             let diagnostic: Diagnostic = {
                 range: convertRange(tsDoc, tsDiag),
                 severity: mapSeverity(tsDiag.category),
