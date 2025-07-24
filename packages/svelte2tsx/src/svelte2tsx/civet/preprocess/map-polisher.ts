@@ -309,6 +309,20 @@ export function polishMap(
         const sourceFile = getOrCreateSourceFile(tsCode);
         const sanitizedCivetLines = getSanitizedLines(civetCode);
 
+        // -------------------------------------------------------------------
+        //  Build per-line token index (Phase-1 optimisation)
+        // -------------------------------------------------------------------
+        // Each entry is an array of { text, col } objects sorted by appearance.
+        type TokenPos = { text: string; col: number };
+        const tokenIndex: TokenPos[][] = sanitizedCivetLines.map((line) => {
+            const out: TokenPos[] = [];
+            line.replace(/[$_a-zA-Z][$_a-zA-Z0-9]*|\d+/g, (match: string, offset: number) => {
+                out.push({ text: match, col: offset });
+                return match;
+            });
+            return out;
+        });
+
         // Step 1: Build whitelist with scanner so identifiers inside comments/strings are ignored
         const idWhitelist = buildIdentifierWhitelist(civetCode);
         logPM('*PM01*', `[Whitelist] Built from sanitized source (${idWhitelist.size} ids): ${Array.from(idWhitelist).join(', ')}`);
@@ -345,7 +359,7 @@ export function polishMap(
                     } else {
                         // Heuristic fallback
                         logPM('*PM06*', `[TraceMap] Precise mapping failed. Falling back to heuristics.`);
-                        const heu = findHeuristicMapping(genLine, genCol, decoded, tsLines, sanitizedCivetLines);
+                        const heu = findHeuristicMapping(genLine, genCol, decoded, tsLines, sanitizedCivetLines, tokenIndex);
                         if (heu) {
                             logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
                             const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
@@ -384,7 +398,8 @@ function findHeuristicMapping(
     genCol: number,
     decoded: DecodedMap,
     tsLines: string[],
-    sanitizedCivetLines: string[]
+    sanitizedCivetLines: string[],
+    tokenIndex: { text: string; col: number }[][]
 ): { line: number; column: number } | null {
     logPM('*PM13*', `[findHeuristicMapping] Entered for genLine ${genLine+1}, genCol ${genCol}`);
     const tsLine = tsLines[genLine];
@@ -398,8 +413,8 @@ function findHeuristicMapping(
         // A token exists at this position. We MUST find it in the source.
         // If we can't, it's a generated token and we should NOT map it.
         // Use a regex to ensure we match the whole word, not a substring
-        const tokenRegex = new RegExp(`\\b${token}\\b`);
-        logPM('*MP09*', `[Heuristic 1] Using regex: ${tokenRegex}`);
+        // Pre-built tokenIndex makes regex unnecessary but keep log for parity
+        logPM('*MP09*', `[Heuristic 1] Using tokenIndex search for "${token}"`);
 
         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
         if (surroundingMapping) {
@@ -409,28 +424,28 @@ function findHeuristicMapping(
             for (let i = 0; i <= searchRadius; i++) {
                 const upLine = searchLine - i;
                 if (upLine >= 0) {
-                    const match = sanitizedCivetLines[upLine].match(tokenRegex);
-                    if (match?.index !== undefined) {
-                        logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${upLine+1}, col ${match.index}.`);
-                        return { line: upLine, column: match.index };
+                    const tokPos = tokenIndex[upLine].find(t => t.text === token);
+                    if (tokPos) {
+                        logPM('*PM16*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${upLine+1}, col ${tokPos.col}.`);
+                        return { line: upLine, column: tokPos.col };
                     }
                 }
                 const downLine = searchLine + i;
                 if (i > 0 && downLine < sanitizedCivetLines.length) {
-                    const match = sanitizedCivetLines[downLine].match(tokenRegex);
-                    if (match?.index !== undefined) {
-                        logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${match.index}.`);
-                        return { line: downLine, column: match.index };
+                    const tokPos = tokenIndex[downLine].find(t => t.text === token);
+                    if (tokPos) {
+                        logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${tokPos.col}.`);
+                        return { line: downLine, column: tokPos.col };
                     }
                 }
             }
         }
         logPM('*PM18*', `[Heuristic 1b] No luck with focused search. Falling back to global search.`);
         for (let i = 0; i < sanitizedCivetLines.length; i++) {
-            const match = sanitizedCivetLines[i].match(tokenRegex);
-            if (match?.index !== undefined) {
-                logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${match.index}.`);
-                return { line: i, column: match.index };
+            const tokPos = tokenIndex[i].find(t => t.text === token);
+            if (tokPos) {
+                logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${tokPos.col}.`);
+                return { line: i, column: tokPos.col };
             }
         }
 
