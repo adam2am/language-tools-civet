@@ -238,14 +238,16 @@ export function polishMap(
     try {
         const tracer = new TraceMap(rawMap);
         const decoded: DecodedMap = decode(rawMap.mappings);
-        const civetLines = civetCode.split('\n');
         const tsLines = tsCode.split('\n');
         const sourceFile = getOrCreateSourceFile(tsCode);
         const sanitizedCivetLines = getSanitizedLines(civetCode);
 
-        // Step 1: Create a whitelist of all valid identifiers from the source code.
-        const idWhitelist = new Set(civetCode.match(/(?:[$_]||\p{ID_Start})(?:[$_]||\p{ID_Continue})*/gu) ?? []);
-        logPM('*PM01*', `Whitelisted identifiers: ${Array.from(idWhitelist).join(', ')}`);
+        // Step 1: Build whitelist **from sanitized source** so identifiers inside
+        // comments/strings are ignored ("Better Spyglass" patch).
+        const sanitizedCodeForWhitelist = sanitizedCivetLines.join('\n');
+        const identifierRegex = /(?:[$_]|\u007F|\p{ID_Start})(?:[$_]|\u007F|\p{ID_Continue})*/gu;
+        const idWhitelist = new Set(sanitizedCodeForWhitelist.match(identifierRegex) ?? []);
+        logPM('*PM01*', `[Whitelist] Built from sanitized source (${idWhitelist.size} ids): ${Array.from(idWhitelist).join(', ')}`);
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
         for (let genLine = 0; genLine < decoded.length; genLine++) {
@@ -279,7 +281,7 @@ export function polishMap(
                     } else {
                         // Heuristic fallback
                         logPM('*PM06*', `[TraceMap] Precise mapping failed. Falling back to heuristics.`);
-                        const heu = findHeuristicMapping(genLine, genCol, decoded, civetLines, tsLines, sanitizedCivetLines);
+                        const heu = findHeuristicMapping(genLine, genCol, decoded, tsLines, sanitizedCivetLines);
                         if (heu) {
                             logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
                             const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
@@ -317,9 +319,8 @@ function findHeuristicMapping(
     genLine: number,
     genCol: number,
     decoded: DecodedMap,
-    civetLines: string[],
     tsLines: string[],
-    sanitizedCivetLines: string[] // Now required
+    sanitizedCivetLines: string[]
 ): { line: number; column: number } | null {
     logPM('*PM13*', `[findHeuristicMapping] Entered for genLine ${genLine+1}, genCol ${genCol}`);
     const tsLine = tsLines[genLine];
@@ -351,7 +352,7 @@ function findHeuristicMapping(
                     }
                 }
                 const downLine = searchLine + i;
-                if (i > 0 && downLine < civetLines.length) {
+                if (i > 0 && downLine < sanitizedCivetLines.length) {
                     const match = sanitizedCivetLines[downLine].match(tokenRegex);
                     if (match?.index !== undefined) {
                         logPM('*PM17*', `[Heuristic 1a] Found token "${token}" in sanitized original at line ${downLine+1}, col ${match.index}.`);
@@ -361,7 +362,7 @@ function findHeuristicMapping(
             }
         }
         logPM('*PM18*', `[Heuristic 1b] No luck with focused search. Falling back to global search.`);
-        for (let i = 0; i < civetLines.length; i++) {
+        for (let i = 0; i < sanitizedCivetLines.length; i++) {
             const match = sanitizedCivetLines[i].match(tokenRegex);
             if (match?.index !== undefined) {
                 logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${match.index}.`);
