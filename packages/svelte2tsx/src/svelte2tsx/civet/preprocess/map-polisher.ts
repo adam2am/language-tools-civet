@@ -20,7 +20,20 @@ type SourceMap = {
 
 // Cache parsed SourceFiles by the *exact* TS code string so we parse once per file.
 const sourceFileCache = new Map<string, ts.SourceFile>();
-const sanitizedSourceCache = new Map<string, string[]>();
+// Replace simple map with bounded LRU cache so long-lived processes don't leak memory
+const sanitizedSourceCache: Map<string, string[]> = new Map();
+const MAX_CACHE_ENTRIES = 50; // todo: expose via config/env in future
+
+/** Moves key to newest position in LRU map */
+function touchLRU<T>(cache: Map<string, T>, key: string, value: T) {
+    if (cache.has(key)) cache.delete(key);
+    cache.set(key, value);
+    if (cache.size > MAX_CACHE_ENTRIES) {
+        // delete oldest entry
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey !== undefined) cache.delete(oldestKey);
+    }
+}
 
 /**
  * Creates a "sanitized" version of the source code where all comments and
@@ -29,23 +42,57 @@ const sanitizedSourceCache = new Map<string, string[]>();
  * The result is cached by the original code string.
  */
 function getSanitizedLines(civetCode: string): string[] {
-    if (sanitizedSourceCache.has(civetCode)) {
+    // Fast-path cache lookup
+    const cached = sanitizedSourceCache.get(civetCode);
+    if (cached) {
         logPM('*MP06*', '[Sanitizer] Cache HIT');
-        return sanitizedSourceCache.get(civetCode)!;
+        return cached;
     }
-    logPM('*MP07*', '[Sanitizer] Cache MISS, creating sanitized source...');
 
-    // Note: Order of replacement matters. Block comments first.
-    const sanitized = civetCode
-        // Block comments: /* ... */
-        .replace(/\/\*[\s\S]*?\*\//g, match => ' '.repeat(match.length))
-        // Line comments: // ...
-        .replace(/\/\/.*/g, match => ' '.repeat(match.length))
-        // All string literals: `...`, '...', "..." (handles escaped quotes)
-        .replace(/(["'`])(?:\\.|(?!\1).)*\1/gs, match => ' '.repeat(match.length));
+    logPM('*MP07*', '[Sanitizer] Cache MISS, creating sanitized source via TS scanner...');
+
+    const text = civetCode;
+    const length = text.length;
+    const shouldBlank = new Uint8Array(length); // 1 === blank
+
+    const mark = (start: number, end: number) => {
+        for (let i = start; i < end; i++) {
+            // Preserve line-breaks to keep line count identical
+            if (text[i] !== '\n' && text[i] !== '\r') {
+                shouldBlank[i] = 1;
+            }
+        }
+    };
+
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, text);
+    while (true) {
+        const token = scanner.scan();
+        if (token === ts.SyntaxKind.EndOfFileToken) break;
+
+        const start = scanner.getTokenPos();
+        const end = scanner.getTextPos();
+
+        switch (token) {
+            case ts.SyntaxKind.SingleLineCommentTrivia:
+            case ts.SyntaxKind.MultiLineCommentTrivia:
+            case ts.SyntaxKind.StringLiteral:
+            case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+            case ts.SyntaxKind.RegularExpressionLiteral:
+            case ts.SyntaxKind.TemplateHead:
+            case ts.SyntaxKind.TemplateMiddle:
+            case ts.SyntaxKind.TemplateTail:
+                mark(start, end);
+                break;
+        }
+    }
+
+    let sanitized = '';
+    for (let i = 0; i < length; i++) {
+        sanitized += shouldBlank[i] ? ' ' : text[i];
+    }
 
     const lines = sanitized.split('\n');
-    sanitizedSourceCache.set(civetCode, lines);
+    touchLRU(sanitizedSourceCache, civetCode, lines);
     logPM('*MP08*', `[Sanitizer] Finished. Source is ${lines.length} lines long.`);
     return lines;
 }
@@ -99,7 +146,8 @@ function findAstGuidedMapping(
     const hint = findLastMappingOnLineBefore(genLine, genCol, decoded) ??
                  findFirstMappingOnLineAfter(genLine, genCol, decoded);
 
-    const searchRadius = 5;
+    const SEARCH_RADIUS = 5; // TODO: expose via config
+    const searchRadius = SEARCH_RADIUS;
     if (hint) {
         for (let i = 0; i <= searchRadius; i++) {
             const up = hint.originalLine - i;
@@ -137,6 +185,25 @@ function withStringHelpers<T extends { file?: string }>(map: T): T & { file: str
         m.toUrl = function () { return 'data:application/json;charset=utf-8,' + encodeURIComponent(this.toString()); };
     }
     return m;
+}
+
+/**
+ * Build a whitelist of all identifier-like tokens that appear in the source.
+ * We include true Identifiers and keyword tokens so that constructs such as
+ * "return" or "if" originating from user code are still whitelisted. This
+ * avoids the fragile Unicode-heavy regex we used before.
+ */
+function buildIdentifierWhitelist(src: string): Set<string> {
+    const ids = new Set<string>();
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, src);
+    while (true) {
+        const token = scanner.scan();
+        if (token === ts.SyntaxKind.EndOfFileToken) break;
+        if (token === ts.SyntaxKind.Identifier || token === ts.SyntaxKind.NumericLiteral) {
+            ids.add(scanner.getTokenText());
+        }
+    }
+    return ids;
 }
 
 // --- LOGGING CONTROL FOR PLAYTESTING ---
@@ -242,11 +309,8 @@ export function polishMap(
         const sourceFile = getOrCreateSourceFile(tsCode);
         const sanitizedCivetLines = getSanitizedLines(civetCode);
 
-        // Step 1: Build whitelist **from sanitized source** so identifiers inside
-        // comments/strings are ignored ("Better Spyglass" patch).
-        const sanitizedCodeForWhitelist = sanitizedCivetLines.join('\n');
-        const identifierRegex = /(?:[$_]|\u007F|\p{ID_Start})(?:[$_]|\u007F|\p{ID_Continue})*/gu;
-        const idWhitelist = new Set(sanitizedCodeForWhitelist.match(identifierRegex) ?? []);
+        // Step 1: Build whitelist with scanner so identifiers inside comments/strings are ignored
+        const idWhitelist = buildIdentifierWhitelist(civetCode);
         logPM('*PM01*', `[Whitelist] Built from sanitized source (${idWhitelist.size} ids): ${Array.from(idWhitelist).join(', ')}`);
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
@@ -340,7 +404,7 @@ function findHeuristicMapping(
         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
         if (surroundingMapping) {
             const searchLine = surroundingMapping.originalLine;
-            const searchRadius = 5; // Search 5 lines up and down
+            const searchRadius = 5; // TODO: use SEARCH_RADIUS const
             logPM('*PM15*', `[Heuristic 1a] Found surrounding mapping. Searching for token near original line ${searchLine + 1} (radius: ${searchRadius}).`);
             for (let i = 0; i <= searchRadius; i++) {
                 const upLine = searchLine - i;
