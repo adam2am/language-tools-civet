@@ -199,8 +199,15 @@ function buildIdentifierWhitelist(src: string): Set<string> {
     while (true) {
         const token = scanner.scan();
         if (token === ts.SyntaxKind.EndOfFileToken) break;
-        if (token === ts.SyntaxKind.Identifier || token === ts.SyntaxKind.NumericLiteral) {
+        if (token === ts.SyntaxKind.Identifier) {
             ids.add(scanner.getTokenText());
+        } else if (token === ts.SyntaxKind.NumericLiteral) {
+            // TS scanner outputs "0." for the "0..." range syntax and likewise "42." for
+            // a bare trailing-dot literal. We need to drop *one* trailing dot, if present,
+            // and otherwise keep the literal exactly as written so floats/hex/etc stay intact.
+            const raw = scanner.getTokenText();
+            const normalized = raw.endsWith('.') ? raw.slice(0, -1) : raw;
+            ids.add(normalized);
         }
     }
     return ids;
