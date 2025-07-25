@@ -141,6 +141,134 @@ export function remapRange(range: Range, sourcemapLines?: SourcemapLines): Range
 }
 
 /**
+ * Identifies source tokens that should be mappable but might not have direct equivalents in generated code.
+ * This handles cases like destructuring patterns where the source token has semantic meaning.
+ */
+function identifyMappableSourceTokens(civetCode: string, _civetInspector: SourceInspector): Map<string, {line: number, column: number, context: string}[]> {
+    const mappableTokens = new Map<string, {line: number, column: number, context: string}[]>();
+    const lines = civetCode.split('\n');
+
+    lines.forEach((line, lineIndex) => {
+        // Pattern 1: Destructuring patterns like {type : "a", body}
+        const destructuringPattern = /\{\s*(\w+)\s*:\s*[^}]+\}/g;
+        let match;
+        while ((match = destructuringPattern.exec(line)) !== null) {
+            const tokenName = match[1];
+            const tokenStart = match.index + match[0].indexOf(tokenName);
+
+            if (!mappableTokens.has(tokenName)) {
+                mappableTokens.set(tokenName, []);
+            }
+            mappableTokens.get(tokenName)!.push({
+                line: lineIndex,
+                column: tokenStart,
+                context: 'destructuring-pattern'
+            });
+
+            logPM('*SOURCE-TOKEN*', `[Source Token] Found mappable token "${tokenName}" in destructuring pattern at ${lineIndex + 1}:${tokenStart}`);
+        }
+
+        // Pattern 2: Other patterns can be added here
+        // TODO: Add more patterns as needed (function parameters, etc.)
+    });
+
+    return mappableTokens;
+}
+
+/**
+ * Creates intelligent mappings for source tokens that don't have direct generated equivalents.
+ * This uses semantic understanding to map source concepts to generated code.
+ */
+function createSemanticMappings(
+    mappableTokens: Map<string, {line: number, column: number, context: string}[]>,
+    decoded: DecodedMap,
+    tsLines: string[],
+    rawMap: SourceMap
+): void {
+    for (const [tokenName, occurrences] of mappableTokens) {
+        for (const occurrence of occurrences) {
+            if (occurrence.context === 'destructuring-pattern') {
+                // Find the best generated position to map this destructuring token to
+                const bestMapping = findBestGeneratedMappingForDestructuring(tokenName, occurrence, decoded, tsLines);
+                if (bestMapping) {
+                    // Insert a new mapping segment
+                    insertSemanticMapping(bestMapping.genLine, bestMapping.genCol, occurrence.line, occurrence.column, decoded, rawMap);
+                    logPM('*SEMANTIC-MAP*', `[Semantic Mapping] Created mapping for "${tokenName}" from source ${occurrence.line + 1}:${occurrence.column} to generated ${bestMapping.genLine + 1}:${bestMapping.genCol}`);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Finds the best position in generated code to map a destructuring pattern token.
+ * For example, maps `type` in `{type: "a"}` to the most appropriate `type` reference in generated code.
+ */
+function findBestGeneratedMappingForDestructuring(
+    tokenName: string,
+    _sourceOccurrence: {line: number, column: number, context: string},
+    decoded: DecodedMap,
+    tsLines: string[]
+): {genLine: number, genCol: number} | null {
+    // Strategy: Find property access patterns like `userStatus.type` that correspond to this destructuring
+    for (let genLine = 0; genLine < tsLines.length; genLine++) {
+        const line = tsLines[genLine];
+
+        // Look for property access patterns: someVar.tokenName
+        const propertyAccessPattern = new RegExp(`\\w+\\.${tokenName}\\b`, 'g');
+        let match;
+        while ((match = propertyAccessPattern.exec(line)) !== null) {
+            const tokenStart = match.index + match[0].lastIndexOf(tokenName);
+
+            // Verify this isn't already mapped and isn't in a comment
+            if (!hasExistingMapping(genLine, tokenStart, decoded)) {
+                logPM('*SEMANTIC-CANDIDATE*', `[Semantic Candidate] Found property access "${tokenName}" at ${genLine + 1}:${tokenStart} for destructuring pattern`);
+                return { genLine, genCol: tokenStart };
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Checks if a position already has a mapping in the decoded source map.
+ */
+function hasExistingMapping(genLine: number, genCol: number, decoded: DecodedMap): boolean {
+    const line = decoded[genLine];
+    if (!line) return false;
+
+    return line.some(seg => seg[0] === genCol && seg.length > 1);
+}
+
+/**
+ * Inserts a new semantic mapping into the decoded source map.
+ */
+function insertSemanticMapping(
+    genLine: number,
+    genCol: number,
+    srcLine: number,
+    srcCol: number,
+    decoded: DecodedMap,
+    _rawMap: SourceMap
+): void {
+    if (!decoded[genLine]) {
+        decoded[genLine] = [];
+    }
+
+    const newSegment: [number, number, number, number] = [genCol, 0, srcLine, srcCol];
+
+    // Insert the segment in the correct position (segments are sorted by column)
+    const line = decoded[genLine];
+    let insertIndex = 0;
+    while (insertIndex < line.length && line[insertIndex][0] < genCol) {
+        insertIndex++;
+    }
+
+    line.splice(insertIndex, 0, newSegment);
+}
+
+/**
  * Given a raw sourcemap from Civet, "polishes" it by applying heuristics
  * to fix common mapping inaccuracies.
  */
@@ -179,16 +307,14 @@ export function polishMap(
         const tsInspector = new SourceInspector(tsCode, { civet: false });
         const tracer = new TraceMap(rawMap);
         const tsLines = tsCode.split('\n');
-        // Use civetInspector.lines for line content, build whitelist inline
-        // Use civetInspector.isPositionMasked and tsInspector.isPositionMasked for masking
-        // Remove all calls to non-existent methods
-        // const civetLines = civetCode.split('\n'); // REMOVED: civetLines
 
-        // --- ADDED LOG: Dump whitelist after build ---
-        // for (const [line, tokens] of lineWhitelist.entries()) { // REMOVED: Whitelist dumping
-        //     logPM('*WHITELIST-DUMP*', `[polishMap] Whitelist line ${line + 1}: tokens = ${Array.from(tokens).join(', ')}`);
-        // }
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
+
+        // PHASE 1: Identify source tokens that should be mappable
+        const mappableTokens = identifyMappableSourceTokens(civetCode, civetInspector);
+
+        // PHASE 2: Create semantic mappings for identified tokens
+        createSemanticMappings(mappableTokens, decoded, tsLines, rawMap);
 
         for (let genLine = 0; genLine < decoded.length; genLine++) {
             const line = decoded[genLine];
@@ -203,18 +329,43 @@ export function polishMap(
 
                     if (token) {
                         logPM('*TOKEN-FOUND*', `[Token] Found token '${token}' at genLine ${genLine+1}, genCol ${genCol}`);
-                        // NEW LOGIC: Prioritize whitelist check for tokens
-                        const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
-                        if (surroundingMapping) {
-                            logPM('*SURROUND-HINT*', `[Hint] Using surrounding mapping at original line ${surroundingMapping.originalLine + 1}`);
-                            const SEARCH_RADIUS = 2;
-                            if (!civetInspector.findToken(token, surroundingMapping.originalLine, SEARCH_RADIUS)) {
-                                logPM('*GATE-FAIL-LOCAL*', `[Gatekeeper] Token "${token}" not found in local context around line ${surroundingMapping.originalLine + 1}. BLOCK.`);
-                                shouldBlock = true; // Block if not in whitelist
+
+                        // ENHANCED CONTEXT-AWARE GATEKEEPER: Check for problematic patterns
+                        const tsLine = tsLines[genLine];
+                        const contextBefore = tsLine?.slice(Math.max(0, genCol - 10), genCol) || '';
+                        const contextAfter = tsLine?.slice(genCol + token.length, genCol + token.length + 10) || '';
+
+                        logPM('*CONTEXT-CHECK*', `[Context] Checking token '${token}' with context: "${contextBefore}►${token}◄${contextAfter}"`);
+
+                        // Block property names in string literals (e.g., 'type' in userStatus)
+                        if (contextBefore.endsWith("'") && contextAfter.startsWith("'")) {
+                            logPM('*GATE-FAIL-STRING*', `[Gatekeeper] Token "${token}" is inside a string literal. BLOCK.`);
+                            shouldBlock = true;
+                        }
+                        // Block property access patterns (e.g., userStatus.type)
+                        else if (contextBefore.endsWith('.')) {
+                            logPM('*GATE-FAIL-PROPERTY*', `[Gatekeeper] Token "${token}" is part of a property access. BLOCK.`);
+                            shouldBlock = true;
+                        }
+                        // Block 'in' operator property checks (e.g., 'type' in userStatus)
+                        else if (contextAfter.trim().startsWith("' in ") || contextAfter.trim().startsWith("\" in ")) {
+                            logPM('*GATE-FAIL-IN-CHECK*', `[Gatekeeper] Token "${token}" is part of an 'in' operator check. BLOCK.`);
+                            shouldBlock = true;
+                        }
+                        else {
+                            // Original whitelist logic for other cases
+                            const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
+                            if (surroundingMapping) {
+                                logPM('*SURROUND-HINT*', `[Hint] Using surrounding mapping at original line ${surroundingMapping.originalLine + 1}`);
+                                const SEARCH_RADIUS = 2;
+                                if (!civetInspector.findToken(token, surroundingMapping.originalLine, SEARCH_RADIUS)) {
+                                    logPM('*GATE-FAIL-LOCAL*', `[Gatekeeper] Token "${token}" not found in local context around line ${surroundingMapping.originalLine + 1}. BLOCK.`);
+                                    shouldBlock = true; // Block if not in whitelist
+                                }
+                            } else {
+                                logPM('*GATE-FAIL-NOHINT*', `[Gatekeeper] No surrounding mapping for "${token}", cannot check local context. BLOCK.`);
+                                shouldBlock = true; // Block if no hint
                             }
-                        } else {
-                            logPM('*GATE-FAIL-NOHINT*', `[Gatekeeper] No surrounding mapping for "${token}", cannot check local context. BLOCK.`);
-                            shouldBlock = true; // Block if no hint
                         }
                     } else {
                         logPM('*TOKEN-NONE*', `[Token] No token found at genLine ${genLine+1}, genCol ${genCol}`);
