@@ -7,7 +7,7 @@ import { offsetToPosition } from './string';
 import { loadCompileOpts } from '../config';
 import type { ProcessResult as ProcessResultType, CompileResult, Transformation } from '../types';
 import { countLogicalLines } from '../chainer/coordinates';
-import { polishMap } from './map-polisher';
+import { polishMap } from './mapPolisher';
 
 export type { ProcessResultType as ProcessResult };
 

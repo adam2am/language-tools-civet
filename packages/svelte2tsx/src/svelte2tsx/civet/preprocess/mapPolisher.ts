@@ -2,6 +2,7 @@ import { decode, encode } from '@jridgewell/sourcemap-codec';
 import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping';
 // Lightweight on-demand use of the TypeScript compiler API for deep inspection
 import ts from 'typescript';
+import { sanitizeSource } from './helpers/sourceSanitizer';
 
 type DecodedMap = ReturnType<typeof decode>;
 
@@ -204,50 +205,6 @@ function withStringHelpers<T extends { file?: string }>(map: T): T & { file: str
     return m;
 }
 
-/**
- * Build a whitelist of all identifier-like tokens that appear in the source.
- * We include true Identifiers and keyword tokens so that constructs such as
- * "return" or "if" originating from user code are still whitelisted. This
- * avoids the fragile Unicode-heavy regex we used before.
- */
-// function buildIdentifierWhitelist(src: string, sourceMask: SourceGuardMask): Set<string> {
-//     const ids = new Set<string>();
-//     const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
-//     const lines = src.split('\\n');
-//     let line = 0;
-//     let lineStart = 0;
-    
-//     while (true) {
-//         const token = scanner.scan();
-//         if (token === ts.SyntaxKind.EndOfFileToken) break;
-
-//         const pos = scanner.getTokenStart();
-//         // This loop logic is tricky. We need to find the correct line for the current token position.
-//         // It's possible for multiple newlines to exist between tokens.
-//         while (pos >= lineStart + lines[line].length + 1 && line < lines.length - 1) {
-//             lineStart += lines[line].length + 1;
-//             line++;
-//         }
-//         const col = pos - lineStart;
-        
-//         if (sourceMask.isMasked(line, col)) {
-//             continue;
-//         }
-
-//         if (token === ts.SyntaxKind.Identifier) {
-//             ids.add(scanner.getTokenText());
-//         } else if (token === ts.SyntaxKind.NumericLiteral) {
-//             // TS scanner outputs "0." for the "0..." range syntax and likewise "42." for
-//             // a bare trailing-dot literal. We need to drop *one* trailing dot, if present,
-//             // and otherwise keep the literal exactly as written so floats/hex/etc stay intact.
-//             const raw = scanner.getTokenText();
-//             const normalized = raw.endsWith('.') ? raw.slice(0, -1) : raw;
-//             ids.add(normalized);
-//         }
-//     }
-//     return ids;
-// }
-
 // --- LOGGING CONTROL FOR PLAYTESTING ---
 const LOGS_ENABLED = true; // Set to false to disable all logs
 function logPM(marker: string, msg: string) {
@@ -264,56 +221,41 @@ function logPM(marker: string, msg: string) {
 // --- NEW: Local line-by-line whitelist ---
 type LineByLineWhitelist = Map<number, Set<string>>; // Map<OriginalLineNumber, Set<TokensOnThatLine>>
 
-function buildLineByLineWhitelist(src: string, sourceMask: SourceGuardMask): LineByLineWhitelist {
+function buildWhitelistFromSanitizedSource(src: string, sourceMask: SourceGuardMask): LineByLineWhitelist {
+    logPM('*WHITELIST-RESILIENT-START*', `[Resilient Whitelist] Fallback tokenizer STARTED. Source has ${src.split('\n').length} lines.`);
     const lineWhitelist: LineByLineWhitelist = new Map();
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
     const lines = src.split('\n');
-    let currentLine = 0;
-    let lineStartPos = 0;
-
-    logPM('*WHITELIST-CTX*', `[Local Whitelist] Building line-by-line ledger...`);
-
-    while (true) {
-        const token = scanner.scan();
-        if (token === ts.SyntaxKind.EndOfFileToken) break;
-
-        const pos = scanner.getTokenStart();
-        while (currentLine < lines.length - 1 && pos >= lineStartPos + lines[currentLine].length + 1) {
-            lineStartPos += lines[currentLine].length + 1;
-            currentLine++;
-        }
-        const col = pos - lineStartPos;
-
-        if (sourceMask.isMasked(currentLine, col)) {
-            logPM('*WHITELIST-MASKED*', `[Local Whitelist] Skipping masked token at line ${currentLine + 1}, col ${col}`);
-            continue;
-        }
-
-        const tokenText = scanner.getTokenText();
-        let normalized = tokenText;
-        switch (true) {
-            case (token === ts.SyntaxKind.Identifier):
-                break;
-            case (token === ts.SyntaxKind.NumericLiteral):
-                normalized = tokenText.endsWith('.') ? tokenText.slice(0, -1) : tokenText;
-                break;
-            case (token === ts.SyntaxKind.StringLiteral):
-                normalized = tokenText.slice(1, -1);
-                break;
-            case (token >= ts.SyntaxKind.FirstKeyword && token <= ts.SyntaxKind.LastKeyword):
-                // Keywords: use as-is
-                break;
-            default:
-                logPM('*WHITELIST-SKIP*', `[Local Whitelist] Skipping non-identifier/keyword token '${tokenText}' at line ${currentLine + 1}`);
+    const tokenRegex = /[\p{L}_$][\p{L}\p{N}_$]*|\d+(?:\.\d*)?/gu;
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        let match;
+        while ((match = tokenRegex.exec(line)) !== null) {
+            let tokenText = match[0];
+            const col = match.index;
+            logPM('*WHITELIST-RESILIENT-TOKEN*', `[Resilient Whitelist] Matched token '${tokenText}' at line ${lineNum + 1}, col ${col} | src = "${line}"`);
+            if (sourceMask.isMasked(lineNum, col)) {
+                logPM('*WHITELIST-RESILIENT-MASKED*', `[Resilient Whitelist] Skipping masked token '${tokenText}' at line ${lineNum + 1}, col ${col}`);
                 continue;
+            }
+
+            // --- NEW NORMALIZATION LOGIC ---
+            // If the token is a number that ends with a dot, strip it.
+            if (/^\d+\.$/.test(tokenText)) {
+                tokenText = tokenText.slice(0, -1); // '1.' -> '1'
+            }
+            // --- END NEW LOGIC ---
+
+            if (!lineWhitelist.has(lineNum)) {
+                lineWhitelist.set(lineNum, new Set());
+            }
+            lineWhitelist.get(lineNum)!.add(tokenText);
+            logPM('*WHITELIST-RESILIENT-ADD*', `[Resilient Whitelist] ADDED token '${tokenText}' to line ${lineNum + 1}`);
         }
-        if (!lineWhitelist.has(currentLine)) {
-            lineWhitelist.set(currentLine, new Set());
-        }
-        lineWhitelist.get(currentLine)!.add(normalized);
-        logPM('*WHITELIST-ADD*', `[Local Whitelist] Added token '${normalized}' to line ${currentLine + 1}`);
     }
-    logPM('*WHITELIST-CTX-DONE*', `[Local Whitelist] Ledger created for ${lineWhitelist.size} lines.`);
+    for (const [line, tokens] of lineWhitelist.entries()) {
+        logPM('*WHITELIST-RESILIENT-LINE*', `[Resilient Whitelist] Line ${line + 1}: tokens = ${Array.from(tokens).join(', ')} | src = "${lines[line] ?? ''}"`);
+    }
+    logPM('*WHITELIST-RESILIENT-DONE*', `[Resilient Whitelist] Fallback tokenizer COMPLETE. Ledger created for ${lineWhitelist.size} lines.`);
     return lineWhitelist;
 }
 
@@ -327,6 +269,7 @@ function isTokenInLocalWhitelist(
     for (let i = -searchRadius; i <= searchRadius; i++) {
         const lineToCheck = originalLineHint + i;
         const tokensOnLine = lineWhitelist.get(lineToCheck);
+        logPM('*GATE-LOCAL-LINE*', `[Gatekeeper] Line ${lineToCheck + 1}: tokens = ${tokensOnLine ? Array.from(tokensOnLine).join(', ') : '(none)'}`);
         if (tokensOnLine && tokensOnLine.has(token)) {
             logPM('*GATE-PASS-LOCAL*', `[Gatekeeper] Token "${token}" found in local whitelist on line ${lineToCheck + 1}. PASS.`);
             return true;
@@ -465,9 +408,14 @@ export function polishMap(
             return out;
         });
 
-        // --- NEW: Build local line-by-line whitelist ---
-        const lineWhitelist = buildLineByLineWhitelist(civetCode, sourceMask);
-        logPM('*PM01*', `[Local Whitelist] Built line-by-line ledger.`);
+        // --- Two-Map Technique ---
+        const cleanCivetSource = sanitizeSource(civetCode);
+        const lineWhitelist: LineByLineWhitelist = buildWhitelistFromSanitizedSource(cleanCivetSource, sourceMask);
+
+        // --- ADDED LOG: Dump whitelist after build ---
+        for (const [line, tokens] of lineWhitelist.entries()) {
+            logPM('*WHITELIST-DUMP*', `[polishMap] Whitelist line ${line + 1}: tokens = ${Array.from(tokens).join(', ')}`);
+        }
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
         for (let genLine = 0; genLine < decoded.length; genLine++) {
@@ -581,38 +529,42 @@ function findHeuristicMapping(
     sanitizedCivetLines: string[],
     tokenIndex: { text: string; col: number }[][],
     sourceMask: SourceGuardMask,
-    lineWhitelist: LineByLineWhitelist // <-- add this param
+    lineWhitelist: LineByLineWhitelist
 ): { line: number; column: number } | null {
     const tsLine = tsLines[genLine];
     if (!tsLine) return null;
 
-    // Add context logging for what we're looking at
     const char_at_pos = tsLine[genCol];
     const next_5_chars = tsLine.slice(genCol, genCol + 5);
     logPM('*CTX*', `[Context] Character at ${genLine+1}:${genCol} is '${char_at_pos}', next few chars: "${next_5_chars}"`);
 
-    // Heuristic 1: Find the token at the generated position
     const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
 
     if (token) {
-        logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position. In whitelist: ${isTokenInLocalWhitelist(token, genLine, 2, lineWhitelist)}`);
-        // A token exists at this position. We MUST find it in the source.
-        // If we can't, it's a generated token and we should NOT map it.
-        logPM('*MP09*', `[Heuristic 1] Using tokenIndex search for "${token}"`);
-
         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
         if (surroundingMapping) {
-            // Log the context of where we're searching
+            // --- ADDED LOG ---
+            const tokensOnLine = lineWhitelist.get(surroundingMapping.originalLine);
+            logPM('*GATE-LOCAL-DEBUG*', `[Gatekeeper] About to check token '${token}' on original line ${surroundingMapping.originalLine + 1}. Whitelist tokens: ${tokensOnLine ? Array.from(tokensOnLine).join(', ') : '(none)'}`);
+        }
+        if (surroundingMapping && !isTokenInLocalWhitelist(token, surroundingMapping.originalLine, 2, lineWhitelist)) {
+            // This is a redundant check now handled by the main gatekeeper, but kept for safety.
+            return null;
+        }
+
+        logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position.`);
+        logPM('*MP09*', `[Heuristic 1] Using tokenIndex search for "${token}"`);
+        
+        if (surroundingMapping) {
             logPM('*SRCH*', `[Search Context] Looking near original line ${surroundingMapping.originalLine+1}, which maps to generated col ${surroundingMapping.generatedColumn}`);
             const searchLine = surroundingMapping.originalLine;
-            const searchRadius = 5; // TODO: use SEARCH_RADIUS const
+            const searchRadius = 5;
             logPM('*PM15*', `[Heuristic 1a] Found surrounding mapping. Searching for token near original line ${searchLine + 1} (radius: ${searchRadius}).`);
             for (let i = 0; i <= searchRadius; i++) {
                 const upLine = searchLine - i;
                 if (upLine >= 0 && upLine < tokenIndex.length) {
                     const tokPos = tokenIndex[upLine]?.find(t => t.text === token);
                     if (tokPos) {
-                        // --- NEW: Source Guard for Heuristics ---
                         if (sourceMask.isMasked(upLine, tokPos.col)) {
                             logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${upLine+1}:${tokPos.col}.`);
                         } else {
@@ -625,7 +577,6 @@ function findHeuristicMapping(
                 if (i > 0 && downLine < sanitizedCivetLines.length && downLine < tokenIndex.length) {
                     const tokPos = tokenIndex[downLine]?.find(t => t.text === token);
                     if (tokPos) {
-                        // --- NEW: Source Guard for Heuristics ---
                         if (sourceMask.isMasked(downLine, tokPos.col)) {
                              logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${downLine+1}:${tokPos.col}.`);
                         } else {
@@ -640,67 +591,23 @@ function findHeuristicMapping(
         for (let i = 0; i < sanitizedCivetLines.length && i < tokenIndex.length; i++) {
             const tokPos = tokenIndex[i]?.find(t => t.text === token);
             if (tokPos) {
-                 // --- NEW: Source Guard for Heuristics ---
                 if (sourceMask.isMasked(i, tokPos.col)) {
                     logPM('*SRC-GUARD*', `[Source Guard] Heuristic result for "${token}" rejected. Lands in source comment at ${i+1}:${tokPos.col}.`);
-                    continue; // Check next line
+                    continue;
                 }
                 logPM('*PM19*', `[Heuristic 1b] Found token "${token}" in sanitized original at line ${i+1}, col ${tokPos.col}.`);
                 return { line: i, column: tokPos.col };
             }
         }
 
-        // IMPORTANT: If we searched for a token and failed to find it, do not proceed.
-        // It's a compiler-generated artifact. Return null to prevent a phantom mapping.
         logPM('*MP12*', `[Heuristic 1] FAILED. Token "${token}" found in generated code but not in sanitized source. Aborting mapping.`);
         return null;
     } else {
-        // Enhanced artifact detection for non-token characters
         logPM('*ART0*', `[Artifact Analysis] Starting check for '${char_at_pos}' at ${genLine+1}:${genCol}`);
         
-        // Look backwards for previous token
-        const beforeText = tsLine.slice(0, genCol);
-        const prevMatch = beforeText.match(/(\w+)\W*$/);
-        const prevToken = prevMatch?.[1];
-        const prevTokenIsInWhitelist = prevToken ? isTokenInLocalWhitelist(prevToken, genLine, 2, lineWhitelist) : true;
-        
-        if (prevToken) {
-            logPM('*ART1*', 
-                `[Artifact Check] Found previous token "${prevToken}"` +
-                `\n    Distance: ${genCol - (beforeText.lastIndexOf(prevToken) ?? 0)}` +
-                `\n    In whitelist: ${prevTokenIsInWhitelist}`
-            );
-        }
+        // Removed the check for prevTokenIsInWhitelist and nextTokenIsInWhitelist.
+        // Punctuation and whitespace should always be allowed to interpolate.
 
-        // Look forwards for next token
-        const afterText = tsLine.slice(genCol + 1);
-        const nextMatch = afterText.match(/^[\W]*(\w+)/);
-        const nextToken = nextMatch?.[1];
-        const nextTokenIsInWhitelist = nextToken ? isTokenInLocalWhitelist(nextToken, genLine, 2, lineWhitelist) : true;
-        
-        if (nextToken) {
-            logPM('*ART2*', 
-                `[Artifact Check] Found next token "${nextToken}"` +
-                `\n    Distance: ${(afterText.indexOf(nextToken) ?? 0) + 1}` +
-                `\n    In whitelist: ${nextTokenIsInWhitelist}`
-            );
-        }
-
-        // --- NEW: Artifact Guard Logic ---
-        // If we're adjacent to a compiler artifact (non-whitelisted token),
-        // do not attempt to map this punctuation/whitespace.
-        if (!prevTokenIsInWhitelist || !nextTokenIsInWhitelist) {
-            logPM('*ART3*', 
-                `[Artifact Guard] Blocking interpolation for '${char_at_pos}'` +
-                `\n    Context: "${tsLine.slice(Math.max(0, genCol-15), genCol)}►${char_at_pos}◄${tsLine.slice(genCol+1, genCol+16)}"` +
-                `\n    Reason: Adjacent to compiler artifact(s):` +
-                (prevToken && !prevTokenIsInWhitelist ? `\n      - Before: "${prevToken}"` : '') +
-                (nextToken && !nextTokenIsInWhitelist ? `\n      - After: "${nextToken}"` : '')
-            );
-            return null;
-        }
-
-        // Only proceed with interpolation if we're not adjacent to artifacts
         logPM('*PM20*', 
             `[Heuristic 2] No token at '${char_at_pos}'. Proceeding with interpolation.` +
             `\n    Context is clean (not adjacent to compiler artifacts)`
@@ -708,28 +615,31 @@ function findHeuristicMapping(
         
         const mapping = findLastMappingOnLineBefore(genLine, genCol, decoded);
         if (mapping) {
-            // Interpolation: apply the column delta from the last mapping
             const delta = genCol - mapping.generatedColumn;
+
+            // --- NEW PROXIMITY CHECK ---
+            const MAX_INTERPOLATION_DISTANCE = 20; // Configurable threshold
+            if (delta > MAX_INTERPOLATION_DISTANCE) {
+                logPM('*HEURISTIC-REJECT*', `[Heuristic 2] Rejecting interpolation. Last mapping is too far away (delta: ${delta}).`);
+                return null; // Reject this mapping and allow fallback to AST.
+            }
+            // --- END NEW LOGIC ---
+
             const newColumn = mapping.originalColumn + delta;
             const newLine = mapping.originalLine;
 
-            // --- NEW: Source Guard for Interpolation ---
             if (sourceMask.isMasked(newLine, newColumn)) {
                 logPM('*SRC-GUARD*', `[Source Guard] Interpolation result rejected. Lands in source comment at ${newLine+1}:${newColumn}.`);
-        return null;
-    }
+                return null;
+            }
 
-            // Log successful interpolation
             logPM('*PM21*', 
                 `[Heuristic 2] Creating interpolated mapping` +
-                `\n    Character: '${char_at_pos}'` +
-                `\n    Context: "${tsLine.slice(Math.max(0, genCol-10), genCol)}►${char_at_pos}◄${tsLine.slice(genCol+1, genCol+11)}"` +
-                `\n    Previous token (safe): ${prevToken || 'none'}` +
-                `\n    Next token (safe): ${nextToken || 'none'}` +
+                `\n    Character: \'${char_at_pos}\'` +
+                `\n    Context: \"${tsLine.slice(Math.max(0, genCol-10), genCol)}►${char_at_pos}◄${tsLine.slice(genCol+1, genCol+11)}\"` +
                 `\n    Delta: ${delta} (from gen ${mapping.generatedColumn} to ${genCol})` +
                 `\n    New column: ${newColumn}`
             );
-
             return { line: newLine, column: newColumn };
         }
     }
@@ -820,16 +730,21 @@ class SourceGuardMask {
                 const spans = isComment ? mask.commentSpans : mask.stringSpans;
                 const start = scanner.getTokenPos();
                 const end = scanner.getTextPos();
-                // This is not very performant, but it's only run once per file.
+                
+                // Add debug log for raw start/end positions
+                logPM('*SG-DEBUG-RAW*', `[SourceGuardMask] Token: ${ts.SyntaxKind[token]} Start: ${start}, End: ${end}`);
+
                 const startLine = tsCode.substring(0, start).split('\n').length - 1;
                 const endLine = tsCode.substring(0, end).split('\n').length - 1;
                 
                 for (let line = startLine; line <= endLine; line++) {
-                    // This is also not very performant.
                     const lineStartPos = tsCode.lastIndexOf('\n', tsCode.length - lines.slice(line).join('\n').length - 2) + 1;
                     
                     const spanStart = (line === startLine) ? start - lineStartPos : 0;
                     const spanEnd = (line === endLine) ? end - lineStartPos : lines[line].length;
+                    
+                    // Add debug logs for calculated span values
+                    logPM('*SG-DEBUG-CALC*', `[SourceGuardMask] Line ${line+1}: lineStartPos=${lineStartPos}, spanStart=${spanStart}, spanEnd=${spanEnd}`);
                     
                     if (!spans.has(line)) {
                         spans.set(line, []);
@@ -838,6 +753,8 @@ class SourceGuardMask {
                 }
             }
         }
+        // Add debug log for the final commentSpans map
+        logPM('*SG-DEBUG-FINAL*', `[SourceGuardMask] Final commentSpans: ${JSON.stringify(Array.from(mask.commentSpans.entries()))}`);
         return mask;
     }
 
