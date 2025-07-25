@@ -425,33 +425,44 @@ export function polishMap(
                 if (seg.length === 1) {
                     const genCol = seg[0];
                     logPM('*SEG-START*', `[Segment] Considering unmapped segment at genLine ${genLine+1}, genCol ${genCol}`);
-                    // If a segment has no source mapping, try to find one.
-                    if (generatedMask.isMasked(genLine, genCol)) {
-                        logPM('*GEN-GUARD*', `[Generated Guard] Blocking mapping for segment inside a TS comment at ${genLine+1}:${genCol}`);
-                        continue;
-                    }
 
                     const token = tsLines[genLine]?.slice(genCol).match(/^\w+/)?.[0];
+                    let shouldBlock = false;
+
                     if (token) {
                         logPM('*TOKEN-FOUND*', `[Token] Found token '${token}' at genLine ${genLine+1}, genCol ${genCol}`);
-                        // --- NEW: Use local whitelist with mapping hint ---
+                        // NEW LOGIC: Prioritize whitelist check for tokens
                         const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
                         if (surroundingMapping) {
                             logPM('*SURROUND-HINT*', `[Hint] Using surrounding mapping at original line ${surroundingMapping.originalLine + 1}`);
                             const SEARCH_RADIUS = 2;
                             if (!isTokenInLocalWhitelist(token, surroundingMapping.originalLine, SEARCH_RADIUS, lineWhitelist)) {
                                 logPM('*GATE-FAIL-LOCAL*', `[Gatekeeper] Token "${token}" not found in local context around line ${surroundingMapping.originalLine + 1}. BLOCK.`);
-                                continue; // It's a compiler artifact, block it.
+                                shouldBlock = true; // Block if not in whitelist
                             }
                         } else {
                             logPM('*GATE-FAIL-NOHINT*', `[Gatekeeper] No surrounding mapping for "${token}", cannot check local context. BLOCK.`);
-                            continue;
+                            shouldBlock = true; // Block if no hint
                         }
                     } else {
                         logPM('*TOKEN-NONE*', `[Token] No token found at genLine ${genLine+1}, genCol ${genCol}`);
-                        // No token here, this logic remains the same (for ']', '{', etc.)
-                        // The artifact guard for non-token characters is still valuable here.
+                        // For non-tokens, apply the generated guard as before
+                        if (generatedMask.isMasked(genLine, genCol)) {
+                            logPM('*GEN-GUARD*', `[Generated Guard] Blocking mapping for segment inside a TS comment at ${genLine+1}:${genCol}`);
+                            shouldBlock = true;
+                        }
                     }
+
+                    if (shouldBlock) {
+                        continue; // Skip to next segment if blocked by any condition
+                    }
+
+                    // If we reached here, it means the segment is not blocked by initial checks.
+                    // Now, for tokens that passed the whitelist, we still need to check the generatedMask
+                    // to avoid mapping to compiler artifacts IF they are not whitelisted.
+                    // This specific segment of logic (the `generatedMask` check) is now inside the token branch above,
+                    // and will only apply to non-tokens.
+                    // For tokens that passed the whitelist, we proceed directly to TraceMap/heuristics.
 
                     logPM('*PM04*', `[Unmapped] Found unmapped segment at genLine ${genLine+1}, genCol ${genCol}. Attempting to polish.`);
                     const pos = originalPositionFor(tracer, { line: genLine + 1, column: genCol });
@@ -718,6 +729,12 @@ class SourceGuardMask {
         const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ false, ts.LanguageVariant.Standard, tsCode);
         const lines = tsCode.split('\n');
 
+        // Pre-calculate line starts once for reliability and performance
+        const lineStarts: number[] = [0];
+        for (let i = 0; i < lines.length - 1; i++) {
+            lineStarts.push(lineStarts[i] + lines[i].length + 1); // +1 for the '\n'
+        }
+
         while (true) {
             const token = scanner.scan();
             if (token === ts.SyntaxKind.EndOfFileToken) break;
@@ -728,23 +745,18 @@ class SourceGuardMask {
 
             if (isComment || isString) {
                 const spans = isComment ? mask.commentSpans : mask.stringSpans;
-                const start = scanner.getTokenPos();
-                const end = scanner.getTextPos();
+                const start = scanner.getTokenStart();
+                const end = scanner.getTokenEnd();
                 
-                // Add debug log for raw start/end positions
-                logPM('*SG-DEBUG-RAW*', `[SourceGuardMask] Token: ${ts.SyntaxKind[token]} Start: ${start}, End: ${end}`);
-
                 const startLine = tsCode.substring(0, start).split('\n').length - 1;
                 const endLine = tsCode.substring(0, end).split('\n').length - 1;
                 
                 for (let line = startLine; line <= endLine; line++) {
-                    const lineStartPos = tsCode.lastIndexOf('\n', tsCode.length - lines.slice(line).join('\n').length - 2) + 1;
+                    // Use the reliable, pre-calculated value for lineStartPos
+                    const lineStartPos = lineStarts[line];
                     
                     const spanStart = (line === startLine) ? start - lineStartPos : 0;
                     const spanEnd = (line === endLine) ? end - lineStartPos : lines[line].length;
-                    
-                    // Add debug logs for calculated span values
-                    logPM('*SG-DEBUG-CALC*', `[SourceGuardMask] Line ${line+1}: lineStartPos=${lineStartPos}, spanStart=${spanStart}, spanEnd=${spanEnd}`);
                     
                     if (!spans.has(line)) {
                         spans.set(line, []);
@@ -753,8 +765,6 @@ class SourceGuardMask {
                 }
             }
         }
-        // Add debug log for the final commentSpans map
-        logPM('*SG-DEBUG-FINAL*', `[SourceGuardMask] Final commentSpans: ${JSON.stringify(Array.from(mask.commentSpans.entries()))}`);
         return mask;
     }
 
