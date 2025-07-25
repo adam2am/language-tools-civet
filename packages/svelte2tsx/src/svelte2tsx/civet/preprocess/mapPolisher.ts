@@ -141,94 +141,43 @@ export function remapRange(range: Range, sourcemapLines?: SourcemapLines): Range
 }
 
 /**
- * Identifies source tokens that should be mappable but might not have direct equivalents in generated code.
- * This handles cases like destructuring patterns where the source token has semantic meaning.
+ * Simple fix for destructuring patterns: creates mappings for tokens like `type` in `{type: "a"}`.
+ * This is a minimal approach that handles the most common case without complex infrastructure.
  */
-function identifyMappableSourceTokens(civetCode: string, _civetInspector: SourceInspector): Map<string, {line: number, column: number, context: string}[]> {
-    const mappableTokens = new Map<string, {line: number, column: number, context: string}[]>();
-    const lines = civetCode.split('\n');
+function createDestructuringMappings(decoded: DecodedMap, civetCode: string, tsLines: string[]): void {
+    // Find destructuring patterns in source
+    const destructuringMatches = [...civetCode.matchAll(/\{(\w+)\s*:/g)];
 
-    lines.forEach((line, lineIndex) => {
-        // Pattern 1: Destructuring patterns like {type : "a", body}
-        const destructuringPattern = /\{\s*(\w+)\s*:\s*[^}]+\}/g;
-        let match;
-        while ((match = destructuringPattern.exec(line)) !== null) {
-            const tokenName = match[1];
-            const tokenStart = match.index + match[0].indexOf(tokenName);
+    for (const match of destructuringMatches) {
+        const tokenName = match[1];
+        const sourcePos = match.index! + match[0].indexOf(tokenName);
+        const sourceLine = civetCode.substring(0, sourcePos).split('\n').length - 1;
+        const sourceCol = sourcePos - civetCode.substring(0, sourcePos).lastIndexOf('\n') - 1;
 
-            if (!mappableTokens.has(tokenName)) {
-                mappableTokens.set(tokenName, []);
-            }
-            mappableTokens.get(tokenName)!.push({
-                line: lineIndex,
-                column: tokenStart,
-                context: 'destructuring-pattern'
-            });
+        // Find corresponding property access in generated code
+        for (let genLine = 0; genLine < tsLines.length; genLine++) {
+            const line = tsLines[genLine];
+            const propertyAccessMatch = line.match(new RegExp(`\\w+\\.${tokenName}\\b`));
 
-            logPM('*SOURCE-TOKEN*', `[Source Token] Found mappable token "${tokenName}" in destructuring pattern at ${lineIndex + 1}:${tokenStart}`);
-        }
+            if (propertyAccessMatch && !hasExistingMapping(genLine, propertyAccessMatch.index! + propertyAccessMatch[0].lastIndexOf(tokenName), decoded)) {
+                const genCol = propertyAccessMatch.index! + propertyAccessMatch[0].lastIndexOf(tokenName);
 
-        // Pattern 2: Other patterns can be added here
-        // TODO: Add more patterns as needed (function parameters, etc.)
-    });
+                // Insert mapping
+                if (!decoded[genLine]) decoded[genLine] = [];
+                const newSegment: [number, number, number, number] = [genCol, 0, sourceLine, sourceCol];
 
-    return mappableTokens;
-}
-
-/**
- * Creates intelligent mappings for source tokens that don't have direct generated equivalents.
- * This uses semantic understanding to map source concepts to generated code.
- */
-function createSemanticMappings(
-    mappableTokens: Map<string, {line: number, column: number, context: string}[]>,
-    decoded: DecodedMap,
-    tsLines: string[],
-    rawMap: SourceMap
-): void {
-    for (const [tokenName, occurrences] of mappableTokens) {
-        for (const occurrence of occurrences) {
-            if (occurrence.context === 'destructuring-pattern') {
-                // Find the best generated position to map this destructuring token to
-                const bestMapping = findBestGeneratedMappingForDestructuring(tokenName, occurrence, decoded, tsLines);
-                if (bestMapping) {
-                    // Insert a new mapping segment
-                    insertSemanticMapping(bestMapping.genLine, bestMapping.genCol, occurrence.line, occurrence.column, decoded, rawMap);
-                    logPM('*SEMANTIC-MAP*', `[Semantic Mapping] Created mapping for "${tokenName}" from source ${occurrence.line + 1}:${occurrence.column} to generated ${bestMapping.genLine + 1}:${bestMapping.genCol}`);
+                // Insert in correct position (sorted by column)
+                let insertIndex = 0;
+                while (insertIndex < decoded[genLine].length && decoded[genLine][insertIndex][0] < genCol) {
+                    insertIndex++;
                 }
+                decoded[genLine].splice(insertIndex, 0, newSegment);
+
+                logPM('*SIMPLE-MAPPING*', `[Simple] Mapped destructuring "${tokenName}" from ${sourceLine + 1}:${sourceCol} to ${genLine + 1}:${genCol}`);
+                break; // Only map to first occurrence
             }
         }
     }
-}
-
-/**
- * Finds the best position in generated code to map a destructuring pattern token.
- * For example, maps `type` in `{type: "a"}` to the most appropriate `type` reference in generated code.
- */
-function findBestGeneratedMappingForDestructuring(
-    tokenName: string,
-    _sourceOccurrence: {line: number, column: number, context: string},
-    decoded: DecodedMap,
-    tsLines: string[]
-): {genLine: number, genCol: number} | null {
-    // Strategy: Find property access patterns like `userStatus.type` that correspond to this destructuring
-    for (let genLine = 0; genLine < tsLines.length; genLine++) {
-        const line = tsLines[genLine];
-
-        // Look for property access patterns: someVar.tokenName
-        const propertyAccessPattern = new RegExp(`\\w+\\.${tokenName}\\b`, 'g');
-        let match;
-        while ((match = propertyAccessPattern.exec(line)) !== null) {
-            const tokenStart = match.index + match[0].lastIndexOf(tokenName);
-
-            // Verify this isn't already mapped and isn't in a comment
-            if (!hasExistingMapping(genLine, tokenStart, decoded)) {
-                logPM('*SEMANTIC-CANDIDATE*', `[Semantic Candidate] Found property access "${tokenName}" at ${genLine + 1}:${tokenStart} for destructuring pattern`);
-                return { genLine, genCol: tokenStart };
-            }
-        }
-    }
-
-    return null;
 }
 
 /**
@@ -237,35 +186,7 @@ function findBestGeneratedMappingForDestructuring(
 function hasExistingMapping(genLine: number, genCol: number, decoded: DecodedMap): boolean {
     const line = decoded[genLine];
     if (!line) return false;
-
     return line.some(seg => seg[0] === genCol && seg.length > 1);
-}
-
-/**
- * Inserts a new semantic mapping into the decoded source map.
- */
-function insertSemanticMapping(
-    genLine: number,
-    genCol: number,
-    srcLine: number,
-    srcCol: number,
-    decoded: DecodedMap,
-    _rawMap: SourceMap
-): void {
-    if (!decoded[genLine]) {
-        decoded[genLine] = [];
-    }
-
-    const newSegment: [number, number, number, number] = [genCol, 0, srcLine, srcCol];
-
-    // Insert the segment in the correct position (segments are sorted by column)
-    const line = decoded[genLine];
-    let insertIndex = 0;
-    while (insertIndex < line.length && line[insertIndex][0] < genCol) {
-        insertIndex++;
-    }
-
-    line.splice(insertIndex, 0, newSegment);
 }
 
 /**
@@ -310,11 +231,8 @@ export function polishMap(
 
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
-        // PHASE 1: Identify source tokens that should be mappable
-        const mappableTokens = identifyMappableSourceTokens(civetCode, civetInspector);
-
-        // PHASE 2: Create semantic mappings for identified tokens
-        createSemanticMappings(mappableTokens, decoded, tsLines, rawMap);
+        // PHASE 1: Create simple mappings for destructuring patterns
+        createDestructuringMappings(decoded, civetCode, tsLines);
 
         for (let genLine = 0; genLine < decoded.length; genLine++) {
             const line = decoded[genLine];
