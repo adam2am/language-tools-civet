@@ -210,43 +210,43 @@ function withStringHelpers<T extends { file?: string }>(map: T): T & { file: str
  * "return" or "if" originating from user code are still whitelisted. This
  * avoids the fragile Unicode-heavy regex we used before.
  */
-function buildIdentifierWhitelist(src: string, sourceMask: SourceGuardMask): Set<string> {
-    const ids = new Set<string>();
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
-    const lines = src.split('\\n');
-    let line = 0;
-    let lineStart = 0;
+// function buildIdentifierWhitelist(src: string, sourceMask: SourceGuardMask): Set<string> {
+//     const ids = new Set<string>();
+//     const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
+//     const lines = src.split('\\n');
+//     let line = 0;
+//     let lineStart = 0;
     
-    while (true) {
-        const token = scanner.scan();
-        if (token === ts.SyntaxKind.EndOfFileToken) break;
+//     while (true) {
+//         const token = scanner.scan();
+//         if (token === ts.SyntaxKind.EndOfFileToken) break;
 
-        const pos = scanner.getTokenStart();
-        // This loop logic is tricky. We need to find the correct line for the current token position.
-        // It's possible for multiple newlines to exist between tokens.
-        while (pos >= lineStart + lines[line].length + 1 && line < lines.length - 1) {
-            lineStart += lines[line].length + 1;
-            line++;
-        }
-        const col = pos - lineStart;
+//         const pos = scanner.getTokenStart();
+//         // This loop logic is tricky. We need to find the correct line for the current token position.
+//         // It's possible for multiple newlines to exist between tokens.
+//         while (pos >= lineStart + lines[line].length + 1 && line < lines.length - 1) {
+//             lineStart += lines[line].length + 1;
+//             line++;
+//         }
+//         const col = pos - lineStart;
         
-        if (sourceMask.isMasked(line, col)) {
-            continue;
-        }
+//         if (sourceMask.isMasked(line, col)) {
+//             continue;
+//         }
 
-        if (token === ts.SyntaxKind.Identifier) {
-            ids.add(scanner.getTokenText());
-        } else if (token === ts.SyntaxKind.NumericLiteral) {
-            // TS scanner outputs "0." for the "0..." range syntax and likewise "42." for
-            // a bare trailing-dot literal. We need to drop *one* trailing dot, if present,
-            // and otherwise keep the literal exactly as written so floats/hex/etc stay intact.
-            const raw = scanner.getTokenText();
-            const normalized = raw.endsWith('.') ? raw.slice(0, -1) : raw;
-            ids.add(normalized);
-        }
-    }
-    return ids;
-}
+//         if (token === ts.SyntaxKind.Identifier) {
+//             ids.add(scanner.getTokenText());
+//         } else if (token === ts.SyntaxKind.NumericLiteral) {
+//             // TS scanner outputs "0." for the "0..." range syntax and likewise "42." for
+//             // a bare trailing-dot literal. We need to drop *one* trailing dot, if present,
+//             // and otherwise keep the literal exactly as written so floats/hex/etc stay intact.
+//             const raw = scanner.getTokenText();
+//             const normalized = raw.endsWith('.') ? raw.slice(0, -1) : raw;
+//             ids.add(normalized);
+//         }
+//     }
+//     return ids;
+// }
 
 // --- LOGGING CONTROL FOR PLAYTESTING ---
 const LOGS_ENABLED = true; // Set to false to disable all logs
@@ -260,6 +260,85 @@ function logPM(marker: string, msg: string) {
 // ---------------------------------------------------------------------------
 //  Source-map helpers (ported from ts-diagnostic.civet)
 // ---------------------------------------------------------------------------
+
+// --- NEW: Local line-by-line whitelist ---
+type LineByLineWhitelist = Map<number, Set<string>>; // Map<OriginalLineNumber, Set<TokensOnThatLine>>
+
+function buildLineByLineWhitelist(src: string, sourceMask: SourceGuardMask): LineByLineWhitelist {
+    const lineWhitelist: LineByLineWhitelist = new Map();
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, /*skipTrivia*/ true, ts.LanguageVariant.Standard, src);
+    const lines = src.split('\n');
+    let currentLine = 0;
+    let lineStartPos = 0;
+
+    logPM('*WHITELIST-CTX*', `[Local Whitelist] Building line-by-line ledger...`);
+
+    while (true) {
+        const token = scanner.scan();
+        if (token === ts.SyntaxKind.EndOfFileToken) break;
+
+        const pos = scanner.getTokenStart();
+        while (currentLine < lines.length - 1 && pos >= lineStartPos + lines[currentLine].length + 1) {
+            lineStartPos += lines[currentLine].length + 1;
+            currentLine++;
+        }
+        const col = pos - lineStartPos;
+
+        if (sourceMask.isMasked(currentLine, col)) {
+            logPM('*WHITELIST-MASKED*', `[Local Whitelist] Skipping masked token at line ${currentLine + 1}, col ${col}`);
+            continue;
+        }
+
+        const tokenText = scanner.getTokenText();
+        let normalized = tokenText;
+        switch (true) {
+            case (token === ts.SyntaxKind.Identifier):
+                break;
+            case (token === ts.SyntaxKind.NumericLiteral):
+                normalized = tokenText.endsWith('.') ? tokenText.slice(0, -1) : tokenText;
+                break;
+            case (token === ts.SyntaxKind.StringLiteral):
+                normalized = tokenText.slice(1, -1);
+                break;
+            case (token >= ts.SyntaxKind.FirstKeyword && token <= ts.SyntaxKind.LastKeyword):
+                // Keywords: use as-is
+                break;
+            default:
+                logPM('*WHITELIST-SKIP*', `[Local Whitelist] Skipping non-identifier/keyword token '${tokenText}' at line ${currentLine + 1}`);
+                continue;
+        }
+        if (!lineWhitelist.has(currentLine)) {
+            lineWhitelist.set(currentLine, new Set());
+        }
+        lineWhitelist.get(currentLine)!.add(normalized);
+        logPM('*WHITELIST-ADD*', `[Local Whitelist] Added token '${normalized}' to line ${currentLine + 1}`);
+    }
+    logPM('*WHITELIST-CTX-DONE*', `[Local Whitelist] Ledger created for ${lineWhitelist.size} lines.`);
+    return lineWhitelist;
+}
+
+function isTokenInLocalWhitelist(
+    token: string,
+    originalLineHint: number,
+    searchRadius: number,
+    lineWhitelist: LineByLineWhitelist
+): boolean {
+    logPM('*GATE-LOCAL-CHECK*', `[Gatekeeper] Checking token '${token}' in local whitelist around line ${originalLineHint + 1} (radius ${searchRadius})`);
+    for (let i = -searchRadius; i <= searchRadius; i++) {
+        const lineToCheck = originalLineHint + i;
+        const tokensOnLine = lineWhitelist.get(lineToCheck);
+        if (tokensOnLine && tokensOnLine.has(token)) {
+            logPM('*GATE-PASS-LOCAL*', `[Gatekeeper] Token "${token}" found in local whitelist on line ${lineToCheck + 1}. PASS.`);
+            return true;
+        } else if (tokensOnLine) {
+            logPM('*GATE-LOCAL-MISS*', `[Gatekeeper] Token "${token}" NOT found on line ${lineToCheck + 1}. Tokens present: ${Array.from(tokensOnLine).join(', ')}`);
+        } else {
+            logPM('*GATE-LOCAL-NOLINE*', `[Gatekeeper] No tokens recorded for line ${lineToCheck + 1}.`);
+        }
+    }
+    logPM('*GATE-FAIL-LOCAL*', `[Gatekeeper] Token "${token}" not found in local whitelist within radius.`);
+    return false;
+}
 
 // Using the same tuple-shape that @jridgewell/sourcemap-codec returns.
 type SourceMapping = [number] | [number, number, number, number];
@@ -386,45 +465,44 @@ export function polishMap(
             return out;
         });
 
-        // Step 1: Build whitelist with scanner so identifiers inside comments/strings are ignored
-        const idWhitelist = buildIdentifierWhitelist(civetCode, sourceMask);
-        logPM('*PM01*', `[Whitelist] Built from sanitized source (${idWhitelist.size} ids): ${Array.from(idWhitelist).join(', ')}`);
+        // --- NEW: Build local line-by-line whitelist ---
+        const lineWhitelist = buildLineByLineWhitelist(civetCode, sourceMask);
+        logPM('*PM01*', `[Local Whitelist] Built line-by-line ledger.`);
         logPM('*PM02*', `Polishing map for file: ${rawMap.file}`);
 
         for (let genLine = 0; genLine < decoded.length; genLine++) {
             const line = decoded[genLine];
             for (let i = 0; i < line.length; i++) {
                 const seg = line[i];
-                // If a segment has no source mapping, try to find one.
                 if (seg.length === 1) {
                     const genCol = seg[0];
-
-                    // --- NEW: Primary Guard ---
-                    // If the segment is inside a comment in the *generated* code, it's an
-                    // unmappable artifact. Skip it before any other logic.
+                    logPM('*SEG-START*', `[Segment] Considering unmapped segment at genLine ${genLine+1}, genCol ${genCol}`);
+                    // If a segment has no source mapping, try to find one.
                     if (generatedMask.isMasked(genLine, genCol)) {
                         logPM('*GEN-GUARD*', `[Generated Guard] Blocking mapping for segment inside a TS comment at ${genLine+1}:${genCol}`);
                         continue;
                     }
 
-                    // Enhanced Gatekeeper logging
                     const token = tsLines[genLine]?.slice(genCol).match(/^\w+/)?.[0];
                     if (token) {
-                        logPM('*GATE1*',
-                            `[Gatekeeper] Found token "${token}" at ${genLine+1}:${genCol}` +
-                            `\n    Context: "${tsLines[genLine].slice(Math.max(0, genCol-10), genCol)}►${tsLines[genLine][genCol]}◄${tsLines[genLine].slice(genCol+1, genCol+11)}"` +
-                            `\n    In whitelist: ${idWhitelist.has(token)}`
-                        );
-
-                        if (!idWhitelist.has(token)) {
-                            logPM('*GATE2*', `[Gatekeeper] Token "${token}" not in whitelist. Skipping mapping.`);
-                        continue; // This is a compiler-generated artifact, do not map it.
+                        logPM('*TOKEN-FOUND*', `[Token] Found token '${token}' at genLine ${genLine+1}, genCol ${genCol}`);
+                        // --- NEW: Use local whitelist with mapping hint ---
+                        const surroundingMapping = findLastMappingOnLineBefore(genLine, genCol, decoded) ?? findFirstMappingOnLineAfter(genLine, genCol, decoded);
+                        if (surroundingMapping) {
+                            logPM('*SURROUND-HINT*', `[Hint] Using surrounding mapping at original line ${surroundingMapping.originalLine + 1}`);
+                            const SEARCH_RADIUS = 2;
+                            if (!isTokenInLocalWhitelist(token, surroundingMapping.originalLine, SEARCH_RADIUS, lineWhitelist)) {
+                                logPM('*GATE-FAIL-LOCAL*', `[Gatekeeper] Token "${token}" not found in local context around line ${surroundingMapping.originalLine + 1}. BLOCK.`);
+                                continue; // It's a compiler artifact, block it.
+                            }
+                        } else {
+                            logPM('*GATE-FAIL-NOHINT*', `[Gatekeeper] No surrounding mapping for "${token}", cannot check local context. BLOCK.`);
+                            continue;
                         }
                     } else {
-                        logPM('*GATE3*',
-                            `[Gatekeeper] No token at ${genLine+1}:${genCol}, found '${tsLines[genLine][genCol]}'` +
-                            `\n    Context: "${tsLines[genLine].slice(Math.max(0, genCol-10), genCol)}►${tsLines[genLine][genCol]}◄${tsLines[genLine].slice(genCol+1, genCol+11)}"`
-                        );
+                        logPM('*TOKEN-NONE*', `[Token] No token found at genLine ${genLine+1}, genCol ${genCol}`);
+                        // No token here, this logic remains the same (for ']', '{', etc.)
+                        // The artifact guard for non-token characters is still valuable here.
                     }
 
                     logPM('*PM04*', `[Unmapped] Found unmapped segment at genLine ${genLine+1}, genCol ${genCol}. Attempting to polish.`);
@@ -438,19 +516,19 @@ export function polishMap(
                             // Fall through to heuristics
                         } else {
                             // Found a valid, precise mapping, create a new segment
-                        logPM('*PM05*', `[TraceMap] Precise mapping found: original line ${pos.line}, col ${pos.column}`);
-                        const newSeg: [number, number, number, number] = [
-                            seg[0],
-                            rawMap.sources.indexOf(pos.source),
-                            pos.line - 1,
-                            pos.column
-                        ];
-                        line[i] = newSeg;
+                            logPM('*PM05*', `[TraceMap] Precise mapping found: original line ${pos.line}, col ${pos.column}`);
+                            const newSeg: [number, number, number, number] = [
+                                seg[0],
+                                rawMap.sources.indexOf(pos.source),
+                                pos.line - 1,
+                                pos.column
+                            ];
+                            line[i] = newSeg;
                             continue; // Skip to next segment
                         }
                     }
 
-                        // Heuristic fallback
+                    // Heuristic fallback
                     logPM('*PM06*', `[TraceMap] Precise mapping failed or was rejected. Falling back to heuristics.`);
                     const heu = findHeuristicMapping(
                         genLine,
@@ -459,23 +537,24 @@ export function polishMap(
                         tsLines,
                         sanitizedCivetLines,
                         tokenIndex,
-                        idWhitelist,
-                        sourceMask // Pass the source mask
+                        // idWhitelist, // replaced by lineWhitelist
+                        sourceMask, // Pass the source mask
+                        lineWhitelist // Pass the pre-built whitelist
                     );
-                        if (heu) {
-                            logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
-                            const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
+                    if (heu) {
+                        logPM('*PM07*', `[Heuristic] Succeeded: found mapping to original line ${heu.line+1}, col ${heu.column}`);
+                        const newSeg: [number, number, number, number] = [seg[0], 0, heu.line, heu.column];
+                        line[i] = newSeg;
+                    } else {
+                        // Deep-dive using TypeScript AST as a last resort
+                        logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
+                        const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines, sourceMask);
+                        if (ast) {
+                            logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
+                            const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
                             line[i] = newSeg;
                         } else {
-                            // Deep-dive using TypeScript AST as a last resort
-                            logPM('*PM08*', `[Heuristic] Failed. Trying AST fallback.`);
-                        const ast = findAstGuidedMapping(genLine, genCol, decoded, sourceFile, sanitizedCivetLines, sourceMask);
-                            if (ast) {
-                                logPM('*PM09*', `[AST] Fallback succeeded: original line ${ast.line+1}, col ${ast.column}`);
-                                const newSeg: [number, number, number, number] = [seg[0], 0, ast.line, ast.column];
-                                line[i] = newSeg;
-                            } else {
-                                logPM('*PM10*', `[AST] Fallback failed: No mapping found for genLine ${genLine+1}, genCol ${genCol}`);
+                            logPM('*PM10*', `[AST] Fallback failed: No mapping found for genLine ${genLine+1}, genCol ${genCol}`);
                         }
                     }
                 }
@@ -501,8 +580,8 @@ function findHeuristicMapping(
     tsLines: string[],
     sanitizedCivetLines: string[],
     tokenIndex: { text: string; col: number }[][],
-    idWhitelist: Set<string>,  // Add whitelist as parameter
-    sourceMask: SourceGuardMask // Add sourceMask as parameter
+    sourceMask: SourceGuardMask,
+    lineWhitelist: LineByLineWhitelist // <-- add this param
 ): { line: number; column: number } | null {
     const tsLine = tsLines[genLine];
     if (!tsLine) return null;
@@ -516,7 +595,7 @@ function findHeuristicMapping(
     const token = tsLine.slice(genCol).match(/^\w+/)?.[0];
 
     if (token) {
-        logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position. In whitelist: ${idWhitelist.has(token)}`);
+        logPM('*TOK1*', `[Token Analysis] Found token "${token}" at position. In whitelist: ${isTokenInLocalWhitelist(token, genLine, 2, lineWhitelist)}`);
         // A token exists at this position. We MUST find it in the source.
         // If we can't, it's a generated token and we should NOT map it.
         logPM('*MP09*', `[Heuristic 1] Using tokenIndex search for "${token}"`);
@@ -583,7 +662,7 @@ function findHeuristicMapping(
         const beforeText = tsLine.slice(0, genCol);
         const prevMatch = beforeText.match(/(\w+)\W*$/);
         const prevToken = prevMatch?.[1];
-        const prevTokenIsInWhitelist = prevToken ? idWhitelist.has(prevToken) : true;
+        const prevTokenIsInWhitelist = prevToken ? isTokenInLocalWhitelist(prevToken, genLine, 2, lineWhitelist) : true;
         
         if (prevToken) {
             logPM('*ART1*', 
@@ -597,7 +676,7 @@ function findHeuristicMapping(
         const afterText = tsLine.slice(genCol + 1);
         const nextMatch = afterText.match(/^[\W]*(\w+)/);
         const nextToken = nextMatch?.[1];
-        const nextTokenIsInWhitelist = nextToken ? idWhitelist.has(nextToken) : true;
+        const nextTokenIsInWhitelist = nextToken ? isTokenInLocalWhitelist(nextToken, genLine, 2, lineWhitelist) : true;
         
         if (nextToken) {
             logPM('*ART2*', 
