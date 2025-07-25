@@ -79,7 +79,7 @@ function getSanitizedLines(civetCode: string, options: Record<string, any> = {})
             if (char === "'" || char === '"' || char === '`') {
                 inString = char;
                 sanitized += ' ';
-            } else if (text.startsWith(singleLineCommentChar, i)) {
+            } else if (text.startsWith(singleLineCommentChar, i) || text.startsWith('//', i)) {
                 inComment = true;
                 sanitized += ' ';
             } else {
@@ -530,8 +530,8 @@ function findHeuristicMapping(
             logPM('*PM15*', `[Heuristic 1a] Found surrounding mapping. Searching for token near original line ${searchLine + 1} (radius: ${searchRadius}).`);
             for (let i = 0; i <= searchRadius; i++) {
                 const upLine = searchLine - i;
-                if (upLine >= 0) {
-                    const tokPos = tokenIndex[upLine].find(t => t.text === token);
+                if (upLine >= 0 && upLine < tokenIndex.length) {
+                    const tokPos = tokenIndex[upLine]?.find(t => t.text === token);
                     if (tokPos) {
                         // --- NEW: Source Guard for Heuristics ---
                         if (sourceMask.isMasked(upLine, tokPos.col)) {
@@ -543,8 +543,8 @@ function findHeuristicMapping(
                     }
                 }
                 const downLine = searchLine + i;
-                if (i > 0 && downLine < sanitizedCivetLines.length) {
-                    const tokPos = tokenIndex[downLine].find(t => t.text === token);
+                if (i > 0 && downLine < sanitizedCivetLines.length && downLine < tokenIndex.length) {
+                    const tokPos = tokenIndex[downLine]?.find(t => t.text === token);
                     if (tokPos) {
                         // --- NEW: Source Guard for Heuristics ---
                         if (sourceMask.isMasked(downLine, tokPos.col)) {
@@ -558,8 +558,8 @@ function findHeuristicMapping(
             }
         }
         logPM('*PM18*', `[Heuristic 1b] No luck with focused search. Falling back to global search.`);
-        for (let i = 0; i < sanitizedCivetLines.length; i++) {
-            const tokPos = tokenIndex[i].find(t => t.text === token);
+        for (let i = 0; i < sanitizedCivetLines.length && i < tokenIndex.length; i++) {
+            const tokPos = tokenIndex[i]?.find(t => t.text === token);
             if (tokPos) {
                  // --- NEW: Source Guard for Heuristics ---
                 if (sourceMask.isMasked(i, tokPos.col)) {
@@ -794,7 +794,7 @@ class SourceGuardMask {
                     if (char === "'" || char === '"' || char === '`') {
                         inString = char;
                         stringStart = j;
-                    } else if (line.startsWith(commentChar, j)) {
+                    } else if (line.startsWith(commentChar, j) || line.startsWith('//', j)) {
                         // We found a comment, mark the rest of the line
                         if (!mask.commentSpans.has(i)) mask.commentSpans.set(i, []);
                         mask.commentSpans.get(i)!.push({ start: j, end: line.length });
